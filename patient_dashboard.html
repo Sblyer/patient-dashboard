@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Patient Notes Dashboard</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; min-height: 100vh; }
+.header { background: #fff; padding: 20px 16px 16px; border-bottom: 1px solid #e5e5e5; position: sticky; top: 0; z-index: 10; }
+.header h1 { font-size: 20px; font-weight: 600; color: #1a1a1a; }
+.header p { font-size: 13px; color: #888; margin-top: 3px; }
+.status-bar { margin: 12px 16px; background: #fff; border-radius: 12px; padding: 12px 16px; border: 1px solid #e5e5e5; display: flex; align-items: center; gap: 10px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: #ccc; flex-shrink: 0; transition: background 0.3s; }
+.dot.active { background: #22c55e; }
+.dot.selected { background: #3b82f6; }
+.status-text { font-size: 14px; color: #555; }
+.status-name { font-weight: 600; color: #3b82f6; }
+.section-label { font-size: 11px; font-weight: 600; color: #aaa; text-transform: uppercase; letter-spacing: 0.08em; padding: 0 16px; margin: 16px 0 8px; }
+.patient-list { padding: 0 16px; display: flex; flex-direction: column; gap: 8px; }
+.patient-card { background: #fff; border: 1.5px solid #e5e5e5; border-radius: 14px; padding: 14px 16px; cursor: pointer; display: flex; align-items: center; gap: 12px; transition: all 0.15s; -webkit-tap-highlight-color: transparent; }
+.patient-card:active { transform: scale(0.98); }
+.patient-card.selected { border-color: #3b82f6; background: #eff6ff; }
+.avatar { width: 42px; height: 42px; border-radius: 50%; background: #f0f0f0; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 600; color: #666; flex-shrink: 0; }
+.patient-card.selected .avatar { background: #dbeafe; color: #1d4ed8; }
+.patient-info { flex: 1; min-width: 0; }
+.patient-name { font-size: 16px; font-weight: 500; color: #1a1a1a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.patient-time { font-size: 13px; color: #888; margin-top: 2px; }
+.patient-status { font-size: 11px; color: #aaa; margin-top: 2px; }
+.check { font-size: 22px; color: #3b82f6; opacity: 0; transition: opacity 0.15s; flex-shrink: 0; }
+.patient-card.selected .check { opacity: 1; }
+.confirm-btn { display: none; margin: 20px 16px 0; padding: 16px; border-radius: 14px; background: #3b82f6; border: none; color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; width: calc(100% - 32px); letter-spacing: -0.01em; }
+.confirm-btn.visible { display: block; }
+.confirm-btn:active { background: #2563eb; transform: scale(0.99); }
+.done-state { display: none; text-align: center; padding: 60px 24px 40px; }
+.done-state.visible { display: block; }
+.done-icon { font-size: 64px; margin-bottom: 16px; }
+.done-title { font-size: 22px; font-weight: 600; color: #1a1a1a; margin-bottom: 8px; }
+.done-sub { font-size: 15px; color: #666; margin-bottom: 32px; line-height: 1.5; }
+.reset-btn { font-size: 15px; color: #3b82f6; background: none; border: none; cursor: pointer; padding: 8px; }
+.loading { text-align: center; padding: 48px 16px; color: #888; font-size: 15px; }
+.error-msg { margin: 12px 16px; background: #fff0f0; border: 1px solid #fca5a5; border-radius: 12px; padding: 12px 16px; color: #dc2626; font-size: 14px; }
+.config-section { padding: 16px; background: #fff; margin: 16px; border-radius: 14px; border: 1px solid #e5e5e5; }
+.config-section h3 { font-size: 14px; font-weight: 600; color: #1a1a1a; margin-bottom: 12px; }
+.config-row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.config-row label { font-size: 12px; color: #888; }
+.config-row input { padding: 10px 12px; border: 1px solid #e5e5e5; border-radius: 8px; font-size: 14px; width: 100%; }
+.save-config-btn { width: 100%; padding: 12px; background: #1a1a1a; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; margin-top: 4px; }
+.empty-state { text-align: center; padding: 40px 16px; color: #aaa; font-size: 14px; }
+</style>
+</head>
+<body>
+
+<div id="config-view" style="display:none;">
+  <div style="padding: 20px 16px 16px; background: #fff; border-bottom: 1px solid #e5e5e5;">
+    <h1 style="font-size: 20px; font-weight: 600; color: #1a1a1a;">Setup</h1>
+    <p style="font-size: 13px; color: #888; margin-top: 3px;">Enter your credentials once</p>
+  </div>
+  <div class="config-section" style="margin-top: 16px;">
+    <h3>DrChrono credentials</h3>
+    <div class="config-row">
+      <label>Refresh Token</label>
+      <input type="password" id="cfg-refresh" placeholder="DrChrono refresh token">
+    </div>
+    <div class="config-row">
+      <label>Client ID</label>
+      <input type="text" id="cfg-client-id" placeholder="DrChrono client ID">
+    </div>
+    <div class="config-row">
+      <label>Client Secret</label>
+      <input type="password" id="cfg-client-secret" placeholder="DrChrono client secret">
+    </div>
+    <div class="config-row">
+      <label>Doctor ID</label>
+      <input type="text" id="cfg-doctor-id" placeholder="e.g. 271496">
+    </div>
+    <div class="config-row">
+      <label>Zapier Storage Secret (UUID)</label>
+      <input type="text" id="cfg-zapier-secret" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+    </div>
+    <button class="save-config-btn" onclick="saveConfig()">Save & continue</button>
+  </div>
+</div>
+
+<div id="main-view" style="display:none;">
+  <div class="header">
+    <h1>Patient notes</h1>
+    <p id="date-display"></p>
+  </div>
+
+  <div class="status-bar">
+    <div class="dot" id="status-dot"></div>
+    <span class="status-text" id="status-text">Tap a patient before recording</span>
+  </div>
+
+  <div id="loading" class="loading">Loading today's patients...</div>
+  <div id="error-msg" class="error-msg" style="display:none;"></div>
+
+  <div id="patient-section" style="display:none;">
+    <div class="section-label">Today's appointments</div>
+    <div class="patient-list" id="patient-list"></div>
+    <button class="confirm-btn" id="confirm-btn" onclick="confirmPatient()">
+      ✓ Ready — start recording now
+    </button>
+  </div>
+
+  <div class="done-state" id="done-state">
+    <div class="done-icon">✅</div>
+    <div class="done-title" id="done-title">Ready to record</div>
+    <div class="done-sub" id="done-sub">Note will upload to DrChrono automatically when Plaud syncs.</div>
+    <button class="reset-btn" onclick="resetDashboard()">← Back to patient list</button>
+  </div>
+
+  <div style="text-align:center; padding: 20px 0 8px;">
+    <button onclick="showConfig()" style="font-size: 12px; color: #ccc; background: none; border: none; cursor: pointer;">Settings</button>
+    <button onclick="loadPatients()" style="font-size: 12px; color: #ccc; background: none; border: none; cursor: pointer; margin-left: 16px;">Refresh</button>
+  </div>
+</div>
+
+<script>
+const STORAGE_KEY = 'drchrono_config';
+let config = {};
+let selectedPatient = null;
+let allPatients = [];
+
+function loadConfig() {
+  const saved = localStorage.getItem(STORAGE_KEY);
+  if (saved) {
+    config = JSON.parse(saved);
+    return true;
+  }
+  return false;
+}
+
+function saveConfig() {
+  config = {
+    refresh_token: document.getElementById('cfg-refresh').value.trim(),
+    client_id: document.getElementById('cfg-client-id').value.trim(),
+    client_secret: document.getElementById('cfg-client-secret').value.trim(),
+    doctor_id: document.getElementById('cfg-doctor-id').value.trim(),
+    zapier_secret: document.getElementById('cfg-zapier-secret').value.trim()
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+  showMain();
+  loadPatients();
+}
+
+function showConfig() {
+  document.getElementById('config-view').style.display = 'block';
+  document.getElementById('main-view').style.display = 'none';
+  if (config.refresh_token) document.getElementById('cfg-refresh').value = config.refresh_token;
+  if (config.client_id) document.getElementById('cfg-client-id').value = config.client_id;
+  if (config.client_secret) document.getElementById('cfg-client-secret').value = config.client_secret;
+  if (config.doctor_id) document.getElementById('cfg-doctor-id').value = config.doctor_id;
+  if (config.zapier_secret) document.getElementById('cfg-zapier-secret').value = config.zapier_secret;
+}
+
+function showMain() {
+  document.getElementById('config-view').style.display = 'none';
+  document.getElementById('main-view').style.display = 'block';
+  const now = new Date();
+  document.getElementById('date-display').textContent = now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+}
+
+async function getAccessToken() {
+  const r = await fetch('https://drchrono.com/o/token/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      refresh_token: config.refresh_token,
+      grant_type: 'refresh_token',
+      client_id: config.client_id,
+      client_secret: config.client_secret
+    })
+  });
+  const data = await r.json();
+  return data.access_token;
+}
+
+async function loadPatients() {
+  document.getElementById('loading').style.display = 'block';
+  document.getElementById('error-msg').style.display = 'none';
+  document.getElementById('patient-section').style.display = 'none';
+  document.getElementById('done-state').classList.remove('visible');
+
+  try {
+    const token = await getAccessToken();
+    const today = new Date().toISOString().split('T')[0];
+    const r = await fetch(`https://app.drchrono.com/api/appointments?date=${today}&doctor=${config.doctor_id}`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    const data = await r.json();
+    const appts = data.results || [];
+
+    const seen = new Set();
+    const patientIds = [];
+    appts.forEach(a => {
+      if (a.patient && !seen.has(a.patient) && a.status !== 'Cancelled' && a.status !== 'No Show') {
+        seen.add(a.patient);
+        patientIds.push({ id: a.patient, time: a.scheduled_time, status: a.status });
+      }
+    });
+
+    const patients = [];
+    for (const appt of patientIds) {
+      const pr = await fetch(`https://app.drchrono.com/api/patients/${appt.id}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const p = await pr.json();
+      patients.push({
+        id: appt.id,
+        name: `${p.first_name} ${p.last_name}`,
+        time: new Date(appt.time).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
+        status: appt.status
+      });
+    }
+
+    allPatients = patients;
+    renderPatients();
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('patient-section').style.display = 'block';
+
+  } catch(e) {
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('error-msg').style.display = 'block';
+    document.getElementById('error-msg').textContent = 'Could not load patients. Check your credentials in Settings.';
+  }
+}
+
+function initials(name) {
+  return name.split(' ').filter(Boolean).map(n => n[0]).join('').slice(0, 2).toUpperCase();
+}
+
+function renderPatients() {
+  const list = document.getElementById('patient-list');
+  list.innerHTML = '';
+  if (allPatients.length === 0) {
+    list.innerHTML = '<div class="empty-state">No appointments found for today.</div>';
+    return;
+  }
+  allPatients.forEach((p, i) => {
+    const card = document.createElement('div');
+    card.className = 'patient-card';
+    card.id = 'card-' + i;
+    card.onclick = () => selectPatient(i);
+    card.innerHTML = `
+      <div class="avatar">${initials(p.name)}</div>
+      <div class="patient-info">
+        <div class="patient-name">${p.name}</div>
+        <div class="patient-time">${p.time}${p.status ? ' · ' + p.status : ''}</div>
+      </div>
+      <span class="check">✓</span>
+    `;
+    list.appendChild(card);
+  });
+}
+
+function selectPatient(i) {
+  selectedPatient = allPatients[i];
+  document.querySelectorAll('.patient-card').forEach((c, j) => {
+    c.classList.toggle('selected', j === i);
+  });
+  document.getElementById('status-dot').className = 'dot selected';
+  document.getElementById('status-text').innerHTML = `Selected: <span class="status-name">${selectedPatient.name}</span>`;
+  document.getElementById('confirm-btn').classList.add('visible');
+}
+
+async function confirmPatient() {
+  document.getElementById('confirm-btn').textContent = 'Saving...';
+  try {
+    await fetch('https://store.zapier.com/api/records', {
+      method: 'POST',
+      headers: { 'X-Secret': config.zapier_secret, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ selected_patient_id: String(selectedPatient.id), selected_patient_name: selectedPatient.name, selected_at: Date.now() })
+    });
+    document.getElementById('patient-section').style.display = 'none';
+    document.getElementById('done-state').classList.add('visible');
+    document.getElementById('done-title').textContent = `Ready for ${selectedPatient.name}`;
+    document.getElementById('done-sub').textContent = `${selectedPatient.name} is selected. Start recording now — the note will upload to DrChrono automatically when Plaud syncs.`;
+    document.getElementById('status-dot').className = 'dot active';
+    document.getElementById('status-text').innerHTML = `Recording for: <span class="status-name">${selectedPatient.name}</span>`;
+  } catch(e) {
+    document.getElementById('confirm-btn').textContent = '✓ Ready — start recording now';
+    alert('Could not save selection. Check your internet connection.');
+  }
+}
+
+function resetDashboard() {
+  selectedPatient = null;
+  document.getElementById('patient-section').style.display = 'block';
+  document.getElementById('done-state').classList.remove('visible');
+  document.getElementById('confirm-btn').classList.remove('visible');
+  document.getElementById('confirm-btn').textContent = '✓ Ready — start recording now';
+  document.getElementById('status-dot').className = 'dot';
+  document.getElementById('status-text').textContent = 'Tap a patient before recording';
+  document.querySelectorAll('.patient-card').forEach(c => c.classList.remove('selected'));
+}
+
+if (loadConfig()) {
+  showMain();
+  loadPatients();
+} else {
+  showConfig();
+}
+</script>
+</body>
+</html>
