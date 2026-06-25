@@ -28,7 +28,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .avatar { width: 42px; height: 42px; border-radius: 50%; background: #f0f0f0; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 600; color: #666; flex-shrink: 0; }
 .patient-card.selected .avatar { background: #dbeafe; color: #1d4ed8; }
 .patient-name { font-size: 16px; font-weight: 500; color: #1a1a1a; }
-.patient-id { font-size: 12px; color: #aaa; margin-top: 2px; }
 .check { font-size: 20px; color: #3b82f6; opacity: 0; margin-left: auto; flex-shrink: 0; }
 .patient-card.selected .check { opacity: 1; }
 .confirm-btn { display: none; margin: 20px 16px; padding: 16px; border-radius: 14px; background: #3b82f6; border: none; color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; width: calc(100% - 32px); }
@@ -40,7 +39,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .done-title { font-size: 22px; font-weight: 700; color: #1a1a1a; margin-bottom: 8px; }
 .done-sub { font-size: 15px; color: #666; line-height: 1.5; margin-bottom: 32px; }
 .reset-btn { font-size: 15px; color: #3b82f6; background: none; border: none; cursor: pointer; padding: 8px; }
-.no-results { text-align: center; padding: 32px 16px; color: #aaa; font-size: 14px; }
 .add-new-btn { margin: 12px 16px 0; padding: 14px 16px; border-radius: 12px; background: #f0f7ff; border: 1.5px dashed #3b82f6; color: #3b82f6; font-size: 15px; font-weight: 500; cursor: pointer; width: calc(100% - 32px); display: none; }
 .add-new-btn.visible { display: block; }
 </style>
@@ -93,16 +91,13 @@ function initials(name) {
 function renderList(patients) {
   const list = document.getElementById('patient-list');
   list.innerHTML = '';
-  patients.forEach((p, i) => {
+  patients.forEach((p) => {
     const card = document.createElement('div');
     card.className = 'patient-card' + (selectedPatient && selectedPatient.name === p.name ? ' selected' : '');
     card.onclick = () => selectPatient(p);
     card.innerHTML = `
       <div class="avatar">${initials(p.name)}</div>
-      <div>
-        <div class="patient-name">${p.name}</div>
-        ${p.id ? `<div class="patient-id">ID: ${p.id}</div>` : ''}
-      </div>
+      <div class="patient-name">${p.name}</div>
       <span class="check">✓</span>
     `;
     list.appendChild(card);
@@ -140,8 +135,7 @@ function titleCase(str) {
 function addNewPatient() {
   const query = document.getElementById('search-input').value.trim();
   if (!query) return;
-  const name = titleCase(query);
-  const patient = { name, id: '' };
+  const patient = { name: titleCase(query) };
   selectPatient(patient);
 }
 
@@ -150,9 +144,8 @@ function selectPatient(p) {
   document.getElementById('status-dot').className = 'dot selected';
   document.getElementById('status-text').innerHTML = `Selected: <span class="status-name">${p.name}</span>`;
   document.getElementById('confirm-btn').classList.add('visible');
-  renderList(document.getElementById('search-input').value.trim() ? 
-    recentPatients.filter(r => r.name.toLowerCase().includes(document.getElementById('search-input').value.toLowerCase())) :
-    recentPatients);
+  const q = document.getElementById('search-input').value.toLowerCase();
+  renderList(q ? recentPatients.filter(r => r.name.toLowerCase().includes(q)) : recentPatients);
 }
 
 async function confirmPatient() {
@@ -160,25 +153,26 @@ async function confirmPatient() {
   btn.textContent = 'Saving...';
   btn.disabled = true;
 
-  // Save to recent patients
+  // Save to recent patients list
   recentPatients = recentPatients.filter(p => p.name !== selectedPatient.name);
   recentPatients.unshift(selectedPatient);
   recentPatients = recentPatients.slice(0, 20);
   localStorage.setItem(STORAGE_KEY, JSON.stringify(recentPatients));
 
-  // Save to Zapier Storage
+  // Save to Zapier Storage using no-cors to avoid CORS block
+  const params = new URLSearchParams({
+    selected_patient_name: selectedPatient.name,
+    selected_at: Date.now()
+  });
+
   try {
-    await fetch('https://store.zapier.com/api/records', {
+    await fetch(`https://store.zapier.com/api/records?${params.toString()}`, {
       method: 'POST',
-      headers: { 'X-Secret': ZAPIER_SECRET, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        selected_patient_name: selectedPatient.name,
-        selected_patient_id: selectedPatient.id || '',
-        selected_at: Date.now()
-      })
+      mode: 'no-cors',
+      headers: { 'X-Secret': ZAPIER_SECRET }
     });
   } catch(e) {
-    console.error('Storage save failed', e);
+    console.log('Storage save attempted');
   }
 
   document.getElementById('main-view').style.display = 'none';
@@ -204,7 +198,6 @@ function reset() {
 }
 
 document.getElementById('search-input').addEventListener('input', e => search(e.target.value));
-
 renderList(recentPatients);
 </script>
 </body>
