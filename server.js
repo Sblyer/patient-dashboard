@@ -5,6 +5,7 @@
 
 const express = require('express');
 const path = require('path');
+const PDFDocument = require('pdfkit');
 
 const {
   DRCHRONO_CLIENT_ID,
@@ -167,6 +168,56 @@ app.post('/api/select', async (req, res) => {
   } catch (e) {
     console.error('POST /api/select:', e.message);
     res.status(502).json({ error: 'storage_failed', detail: e.message });
+  }
+});
+
+// Render the note text to a one-page PDF (DrChrono /documents wants a file, not raw text).
+function notePdf(title, body) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 54 });
+    const chunks = [];
+    doc.on('data', c => chunks.push(c));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+    doc.fontSize(15).text(title || 'Clinical Note');
+    doc.moveDown(0.6);
+    doc.fontSize(11).text(String(body || ''), { align: 'left' });
+    doc.end();
+  });
+}
+
+// Upload a note straight onto the selected patient's chart in DrChrono.
+// This replaces the brittle "upload" step in the Zap: it reads the selected
+// patient from Storage and posts the note as a document using our own DrChrono auth.
+// The Zap only has to POST the note text here: { "note": "...", "title": "..." }.
+app.post('/api/note', async (req, res) => {
+  const note = req.body && req.body.note;
+  const title = req.body && req.body.title;
+  if (!note || !String(note).trim()) return res.status(400).json({ error: 'note_required' });
+  try {
+    const store = await zapGet();
+    const pid = store && store.selected_patient_id;
+    const pname = (store && store.selected_patient_name) || '';
+    if (!pid) return res.status(409).json({ error: 'no_patient_selected' });
+
+    const token = await getAccessToken();
+    const pdf = await notePdf(title || `Note for ${pname}`, note);
+    const form = new FormData();
+    form.append('patient', String(pid));
+    form.append('doctor', String(DRCHRONO_DOCTOR_ID));
+    form.append('date', todayInTz(DRCHRONO_TZ));
+    form.append('description', (title || 'Plaud note') + (pname ? ' - ' + pname : ''));
+    form.append('document', new Blob([pdf], { type: 'application/pdf' }), 'note.pdf');
+
+    let r = await fetch('https://app.drchrono.com/api/documents', { method: 'POST', headers: { Authorization: 'Bearer ' + token }, body: form });
+    if (r.status === 401) { accessToken = null; const t2 = await getAccessToken();
+      r = await fetch('https://app.drchrono.com/api/documents', { method: 'POST', headers: { Authorization: 'Bearer ' + t2 }, body: form }); }
+    const text = await r.text();
+    if (!r.ok) { console.error('note upload', r.status, text.slice(0, 200)); return res.status(502).json({ error: 'drchrono_upload_failed', status: r.status, detail: text.slice(0, 300) }); }
+    res.json({ ok: true, patient_id: pid, patient_name: pname, document: JSON.parse(text || '{}') });
+  } catch (e) {
+    console.error('POST /api/note:', e.message);
+    res.status(500).json({ error: 'note_failed', detail: e.message });
   }
 });
 
