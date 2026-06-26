@@ -1,0 +1,15 @@
+{
+  "name": "patient-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Plaud to DrChrono patient-note selector. Tap today's patient, the note uploads to the right chart.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

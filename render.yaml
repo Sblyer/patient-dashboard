@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: patient-dashboard
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: DRCHRONO_CLIENT_ID
+        sync: false
+      - key: DRCHRONO_CLIENT_SECRET
+        sync: false
+      - key: DRCHRONO_REFRESH_TOKEN
+        sync: false
+      - key: ZAPIER_STORAGE_SECRET
+        sync: false
+      - key: DRCHRONO_DOCTOR_ID
+        value: "271496"
+      - key: DRCHRONO_TZ
+        value: America/New_York

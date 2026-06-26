@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Patient Notes</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; min-height: 100vh; }
+.header { background: #fff; padding: 20px 16px 16px; border-bottom: 1px solid #e5e5e5; }
+.header h1 { font-size: 22px; font-weight: 700; color: #1a1a1a; }
+.header p { font-size: 13px; color: #888; margin-top: 3px; }
+.search-box { margin: 16px; position: relative; }
+.search-input { width: 100%; padding: 14px 16px 14px 44px; border: 1.5px solid #e5e5e5; border-radius: 12px; font-size: 16px; background: #fff; outline: none; -webkit-appearance: none; }
+.search-input:focus { border-color: #3b82f6; }
+.search-icon { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); font-size: 18px; color: #aaa; pointer-events: none; }
+.status-bar { margin: 0 16px 16px; background: #fff; border-radius: 12px; padding: 12px 16px; border: 1px solid #e5e5e5; display: flex; align-items: center; gap: 10px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: #ccc; flex-shrink: 0; transition: background 0.3s; }
+.dot.selected { background: #3b82f6; }
+.dot.saved { background: #22c55e; }
+.status-text { font-size: 14px; color: #555; }
+.status-name { font-weight: 600; color: #3b82f6; }
+.section-label { font-size: 11px; font-weight: 600; color: #aaa; text-transform: uppercase; letter-spacing: 0.08em; padding: 0 16px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+.reload-link { color: #3b82f6; cursor: pointer; text-transform: none; letter-spacing: 0; font-weight: 600; }
+.patient-list { padding: 0 16px; display: flex; flex-direction: column; gap: 8px; }
+.patient-card { background: #fff; border: 1.5px solid #e5e5e5; border-radius: 14px; padding: 14px 16px; cursor: pointer; display: flex; align-items: center; gap: 12px; transition: all 0.1s; -webkit-tap-highlight-color: transparent; user-select: none; }
+.patient-card:active { transform: scale(0.98); background: #f8f8f8; }
+.patient-card.selected { border-color: #3b82f6; background: #eff6ff; }
+.avatar { width: 42px; height: 42px; border-radius: 50%; background: #f0f0f0; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 600; color: #666; flex-shrink: 0; }
+.patient-card.selected .avatar { background: #dbeafe; color: #1d4ed8; }
+.patient-name { font-size: 16px; font-weight: 500; color: #1a1a1a; }
+.check { font-size: 20px; color: #3b82f6; opacity: 0; margin-left: auto; flex-shrink: 0; }
+.patient-card.selected .check { opacity: 1; }
+.confirm-btn { display: none; margin: 20px 16px; padding: 16px; border-radius: 14px; background: #3b82f6; border: none; color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; width: calc(100% - 32px); }
+.confirm-btn.visible { display: block; }
+.confirm-btn:active { background: #2563eb; }
+.confirm-btn:disabled { opacity: 0.6; }
+.done-state { display: none; text-align: center; padding: 60px 24px; }
+.done-state.visible { display: block; }
+.done-icon { font-size: 64px; margin-bottom: 16px; }
+.done-title { font-size: 22px; font-weight: 700; color: #1a1a1a; margin-bottom: 8px; }
+.done-sub { font-size: 15px; color: #666; line-height: 1.5; margin-bottom: 32px; }
+.reset-btn { font-size: 15px; color: #3b82f6; background: none; border: none; cursor: pointer; padding: 8px; }
+.add-new-btn { margin: 12px 16px 0; padding: 14px 16px; border-radius: 12px; background: #f0f7ff; border: 1.5px dashed #3b82f6; color: #3b82f6; font-size: 15px; font-weight: 500; cursor: pointer; width: calc(100% - 32px); display: none; }
+.add-new-btn.visible { display: block; }
+.notice { margin: 0 16px 16px; padding: 12px 14px; border-radius: 12px; font-size: 13px; line-height: 1.4; display: none; }
+.notice.visible { display: block; }
+.notice.info { background: #f0f0f0; color: #666; }
+.notice.warn { background: #fff4e5; color: #92400e; border: 1px solid #fde2b8; }
+.muted { padding: 24px 16px; text-align: center; color: #aaa; font-size: 14px; }
+</style>
+</head>
+<body>
+
+<div id="main-view">
+  <div class="header">
+    <h1>Patient Notes</h1>
+    <p id="date-display"></p>
+  </div>
+
+  <div class="search-box">
+    <span class="search-icon">🔍</span>
+    <input type="text" class="search-input" id="search-input" placeholder="Search today's patients..." autocomplete="off" autocorrect="off" spellcheck="false">
+  </div>
+
+  <div class="status-bar">
+    <div class="dot" id="status-dot"></div>
+    <span class="status-text" id="status-text">Tap a patient before recording</span>
+  </div>
+
+  <div class="notice" id="notice"></div>
+
+  <div class="section-label" id="section-label">
+    <span id="section-label-text">Today's schedule</span>
+    <span class="reload-link" id="reload-link" onclick="loadSchedule()">Reload</span>
+  </div>
+  <div class="patient-list" id="patient-list"></div>
+  <button class="add-new-btn" id="add-new-btn" onclick="addManualPatient()"></button>
+  <button class="confirm-btn" id="confirm-btn" onclick="confirmPatient()">✓ Ready — start recording now</button>
+</div>
+
+<div class="done-state" id="done-state">
+  <div class="done-icon">✅</div>
+  <div class="done-title" id="done-title">Ready to record</div>
+  <div class="done-sub" id="done-sub">Note will upload automatically when Plaud syncs.</div>
+  <button class="reset-btn" onclick="reset()">← Back to patient list</button>
+</div>
+
+<script>
+let selectedPatient = null;   // { id, name }
+let todaysPatients = [];      // [{ id, name }] from DrChrono
+
+const el = (id) => document.getElementById(id);
+el('date-display').textContent = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+
+function initials(name) {
+  return name.split(' ').filter(Boolean).map(n => n[0]).join('').slice(0, 2).toUpperCase();
+}
+
+function titleCase(str) {
+  return str.replace(/\w\S*/g, t => t.charAt(0).toUpperCase() + t.substr(1).toLowerCase());
+}
+
+function showNotice(msg, kind) {
+  const n = el('notice');
+  n.textContent = msg;
+  n.className = 'notice visible ' + (kind || 'info');
+}
+function hideNotice() { el('notice').className = 'notice'; }
+
+function renderList(patients) {
+  const list = el('patient-list');
+  list.innerHTML = '';
+  if (!patients.length) {
+    list.innerHTML = '<div class="muted">No matching patients.</div>';
+    return;
+  }
+  patients.forEach((p) => {
+    const card = document.createElement('div');
+    const isSel = selectedPatient && selectedPatient.id === p.id && selectedPatient.name === p.name;
+    card.className = 'patient-card' + (isSel ? ' selected' : '');
+    card.onclick = () => selectPatient(p);
+    card.innerHTML =
+      '<div class="avatar">' + initials(p.name) + '</div>' +
+      '<div class="patient-name">' + p.name + '</div>' +
+      '<span class="check">✓</span>';
+    list.appendChild(card);
+  });
+}
+
+function filtered() {
+  const q = el('search-input').value.toLowerCase().trim();
+  if (!q) return todaysPatients;
+  return todaysPatients.filter(p => p.name.toLowerCase().includes(q));
+}
+
+function search() {
+  const q = el('search-input').value.trim();
+  const list = filtered();
+  el('section-label-text').textContent = q ? (list.length ? 'Matching patients' : 'No matches found') : "Today's schedule";
+  renderList(list);
+
+  // Manual add fallback: lets you record for someone not on today's pulled list.
+  const addBtn = el('add-new-btn');
+  if (q.length >= 2 && !list.some(p => p.name.toLowerCase() === q.toLowerCase())) {
+    addBtn.textContent = '+ Use "' + titleCase(q) + '" (name only, no chart match)';
+    addBtn.classList.add('visible');
+  } else {
+    addBtn.classList.remove('visible');
+  }
+}
+
+async function loadSchedule() {
+  hideNotice();
+  el('section-label-text').textContent = "Today's schedule";
+  el('patient-list').innerHTML = '<div class="muted">Loading today\'s schedule…</div>';
+  try {
+    const r = await fetch('/api/today');
+    if (!r.ok) throw new Error('status ' + r.status);
+    const data = await r.json();
+    todaysPatients = (data.patients || []);
+    if (!todaysPatients.length) {
+      showNotice("No patients on today's schedule yet. Add one in DrChrono, then tap Reload. You can also search a name to record without a chart match.", 'info');
+    }
+    search();
+  } catch (e) {
+    todaysPatients = [];
+    el('patient-list').innerHTML = '';
+    showNotice("Couldn't load today's schedule. Tap Reload to retry, or search a name to record without a chart match.", 'warn');
+  }
+}
+
+function selectPatient(p) {
+  selectedPatient = p;
+  el('status-dot').className = 'dot selected';
+  el('status-text').innerHTML = 'Selected: <span class="status-name">' + p.name + '</span>';
+  el('confirm-btn').classList.add('visible');
+  renderList(filtered());
+}
+
+function addManualPatient() {
+  const q = el('search-input').value.trim();
+  if (!q) return;
+  selectPatient({ id: null, name: titleCase(q) });
+}
+
+async function confirmPatient() {
+  if (!selectedPatient) return;
+  const btn = el('confirm-btn');
+  btn.textContent = 'Saving…';
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/select', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: selectedPatient.id, name: selectedPatient.name }),
+    });
+    if (!r.ok) throw new Error('status ' + r.status);
+  } catch (e) {
+    btn.textContent = 'Could not save — tap to retry';
+    btn.disabled = false;
+    return;
+  }
+
+  el('main-view').style.display = 'none';
+  el('done-state').classList.add('visible');
+  el('done-title').textContent = 'Ready for ' + selectedPatient.name;
+  const idNote = selectedPatient.id ? '' : ' (matched by name only)';
+  el('done-sub').textContent = selectedPatient.name + ' is selected' + idNote + '. Start your Plaud recording now, the note will upload to DrChrono automatically.';
+  el('status-dot').className = 'dot saved';
+}
+
+function reset() {
+  selectedPatient = null;
+  el('main-view').style.display = 'block';
+  el('done-state').classList.remove('visible');
+  el('confirm-btn').classList.remove('visible');
+  el('confirm-btn').textContent = '✓ Ready — start recording now';
+  el('confirm-btn').disabled = false;
+  el('status-dot').className = 'dot';
+  el('status-text').textContent = 'Tap a patient before recording';
+  el('search-input').value = '';
+  el('add-new-btn').classList.remove('visible');
+  search();
+}
+
+el('search-input').addEventListener('input', search);
+loadSchedule();
+</script>
+</body>
+</html>
