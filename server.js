@@ -191,9 +191,11 @@ function notePdf(title, body) {
 // patient from Storage and posts the note as a document using our own DrChrono auth.
 // The Zap only has to POST the note text here: { "note": "...", "title": "..." }.
 app.post('/api/note', async (req, res) => {
-  const note = req.body && req.body.note;
-  const title = req.body && req.body.title;
-  if (!note || !String(note).trim()) return res.status(400).json({ error: 'note_required' });
+  const b = req.body || {};
+  // Accept the note text under any common field name so the Zap mapping cannot miss.
+  const note = b.note || b.transcript || b.text || b.body || b.message || b.content || b.summary;
+  const title = b.title || b.subject || b.name;
+  if (!note || !String(note).trim()) return res.status(400).json({ error: 'note_required', hint: 'send the note text as "note"' });
   try {
     const store = await zapGet();
     const pid = store && store.selected_patient_id;
