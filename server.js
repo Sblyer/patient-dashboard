@@ -113,8 +113,7 @@ function todayInTz(tz) {
   }).format(new Date());
 }
 
-async function fetchTodaysPatients() {
-  const date = todayInTz(DRCHRONO_TZ);
+async function fetchPatientsForDate(date) {
   const ids = new Set();
   let next = `${API}/appointments?date=${date}&doctor=${DRCHRONO_DOCTOR_ID}`;
   let guard = 0;
@@ -138,6 +137,64 @@ async function fetchTodaysPatients() {
   }
   patients.sort((a, b) => a.name.localeCompare(b.name));
   return { date, patients };
+}
+
+async function fetchTodaysPatients() { return fetchPatientsForDate(todayInTz(DRCHRONO_TZ)); }
+
+// ---------- Patient name matching ----------
+// Plaud names the patient in every note ("[patient]: Sandra" in the summary, and
+// after the colon in the subject). Matching that to the day's schedule lets each
+// note file to its own chart even when several are synced at once — instead of
+// relying on whoever was tapped last, which mixed up batch syncs.
+function normName(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// Pull the recording date out of the Plaud subject ("[Plaud-AutoFlow] 06-29 ...")
+// so a note synced in the evening / next morning still matches the right day.
+function parseNoteDate(title) {
+  const m = String(title || '').match(/\b(\d{2})-(\d{2})\b/); // MM-DD
+  if (!m) return null;
+  const mm = +m[1], dd = +m[2];
+  if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return null;
+  const today = todayInTz(DRCHRONO_TZ); // YYYY-MM-DD
+  const year = Number(today.slice(0, 4));
+  let cand = `${year}-${m[1]}-${m[2]}`;
+  if (cand > today) cand = `${year - 1}-${m[1]}-${m[2]}`; // future date => last year's note
+  return cand;
+}
+
+function extractPatientName(note, title) {
+  const text = String(note || '');
+  // Primary: the structured "[patient]: Name" field Plaud emits in the summary.
+  const m = text.match(/\[patient\][^\n:]*[:\-]+\s*([^\n\r]+)/i);
+  if (m && m[1]) {
+    const v = m[1].replace(/\[.*?\]/g, '').trim();
+    if (v && !/^(not stated|unknown|n\/?a)$/i.test(v)) return v;
+  }
+  // Fallback: name after the last colon in the subject ("... Care: Sandra").
+  const t = String(title || '');
+  if (t.includes(':')) {
+    const after = t.split(':').pop().trim();
+    if (after && after.length <= 60) return after;
+  }
+  return '';
+}
+
+// Match the extracted name to one scheduled patient. Only returns a match when it
+// is unambiguous; anything fuzzy returns null so the caller falls back safely.
+function matchPatient(candidate, patients) {
+  const c = normName(candidate);
+  if (!c) return { match: null, reason: 'no_name_extracted' };
+  const exact = patients.filter(p => normName(p.name) === c);
+  if (exact.length === 1) return { match: exact[0], reason: 'exact' };
+  const contains = patients.filter(p => { const n = normName(p.name); return n.includes(c) || c.includes(n); });
+  if (contains.length === 1) return { match: contains[0], reason: 'contains' };
+  const cFirst = c.split(' ')[0];
+  const firstMatch = patients.filter(p => normName(p.name).split(' ')[0] === cFirst);
+  if (firstMatch.length === 1) return { match: firstMatch[0], reason: 'first_name' };
+  if (firstMatch.length > 1) return { match: null, reason: 'ambiguous_first_name', candidates: firstMatch.map(p => p.name) };
+  return { match: null, reason: 'no_match' };
 }
 
 // ---------- HTTP ----------
@@ -197,10 +254,28 @@ app.post('/api/note', async (req, res) => {
   const title = b.title || b.subject || b.name;
   if (!note || !String(note).trim()) return res.status(400).json({ error: 'note_required', hint: 'send the note text as "note"' });
   try {
-    const store = await zapGet();
-    const pid = store && store.selected_patient_id;
-    const pname = (store && store.selected_patient_name) || '';
-    if (!pid) return res.status(409).json({ error: 'no_patient_selected' });
+    // PRIMARY: read the patient's name out of the note/subject and match it to that
+    // day's schedule, so every note routes to its own chart even when several are
+    // synced at once. FALLBACK: the last tapped selection in Storage (old behavior),
+    // so this can only improve on the previous result, never regress.
+    let pid = '', pname = '', routed = null;
+    try {
+      const noteDate = parseNoteDate(title) || todayInTz(DRCHRONO_TZ);
+      const { patients } = await fetchPatientsForDate(noteDate);
+      const candidate = extractPatientName(note, title);
+      const result = matchPatient(candidate, patients);
+      if (result.match) { pid = String(result.match.id); pname = result.match.name; routed = 'name:' + result.reason; }
+      else { console.warn('note name-match fallback:', JSON.stringify({ candidate, date: noteDate, reason: result.reason, candidates: result.candidates })); }
+    } catch (e) {
+      console.error('schedule match failed, falling back to selection:', e.message);
+    }
+    if (!pid) {
+      const store = await zapGet();
+      pid = store && store.selected_patient_id ? String(store.selected_patient_id) : '';
+      pname = (store && store.selected_patient_name) || '';
+      routed = 'selection';
+    }
+    if (!pid) return res.status(409).json({ error: 'no_patient_resolved' });
 
     const token = await getAccessToken();
     const pdf = await notePdf(title || `Note for ${pname}`, note);
@@ -216,7 +291,7 @@ app.post('/api/note', async (req, res) => {
       r = await fetch('https://app.drchrono.com/api/documents', { method: 'POST', headers: { Authorization: 'Bearer ' + t2 }, body: form }); }
     const text = await r.text();
     if (!r.ok) { console.error('note upload', r.status, text.slice(0, 200)); return res.status(502).json({ error: 'drchrono_upload_failed', status: r.status, detail: text.slice(0, 300) }); }
-    res.json({ ok: true, patient_id: pid, patient_name: pname, document: JSON.parse(text || '{}') });
+    res.json({ ok: true, routed, patient_id: pid, patient_name: pname, document: JSON.parse(text || '{}') });
   } catch (e) {
     console.error('POST /api/note:', e.message);
     res.status(500).json({ error: 'note_failed', detail: e.message });
