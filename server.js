@@ -150,6 +150,28 @@ function normName(s) {
   return String(s || '').toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+// Similarity of two names (0..1), used to tolerate Plaud's misspellings when
+// matching against the small, distinct daily schedule (e.g. "Giselle Rayo" vs
+// "Gisselle Raio"). Levenshtein-based ratio on normalized names.
+function editDistance(a, b) {
+  const m = a.length, n = b.length;
+  if (!m) return n; if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+function simRatio(a, b) {
+  a = normName(a); b = normName(b);
+  if (!a || !b) return 0;
+  return 1 - editDistance(a, b) / Math.max(a.length, b.length);
+}
+
 // Pull the recording date out of the Plaud subject ("[Plaud-AutoFlow] 06-29 ...")
 // so a note synced in the evening / next morning still matches the right day.
 function parseNoteDate(title) {
@@ -194,7 +216,15 @@ function matchPatient(candidate, patients) {
   const firstMatch = patients.filter(p => normName(p.name).split(' ')[0] === cFirst);
   if (firstMatch.length === 1) return { match: firstMatch[0], reason: 'first_name' };
   if (firstMatch.length > 1) return { match: null, reason: 'ambiguous_first_name', candidates: firstMatch.map(p => p.name) };
-  return { match: null, reason: 'no_match' };
+  // Fuzzy pass: tolerate misspellings, but only accept a clear, unique winner so a
+  // garbled or absent name can never be forced onto the wrong chart.
+  const scored = patients
+    .map(p => ({ p, s: simRatio(c, p.name) }))
+    .sort((x, y) => y.s - x.s);
+  if (scored[0] && scored[0].s >= 0.82 && (!scored[1] || scored[0].s - scored[1].s >= 0.12)) {
+    return { match: scored[0].p, reason: 'fuzzy_' + scored[0].s.toFixed(2) };
+  }
+  return { match: null, reason: 'no_match', candidates: scored.slice(0, 3).map(x => x.p.name + ':' + x.s.toFixed(2)) };
 }
 
 // ---------- HTTP ----------
@@ -269,13 +299,20 @@ app.post('/api/note', async (req, res) => {
     } catch (e) {
       console.error('schedule match failed, falling back to selection:', e.message);
     }
+    // SAFETY: never fall back to the last tapped selection. A stale selection files
+    // the note onto the wrong patient when Plaud emails arrive batched or delayed
+    // (root cause of notes landing on other patients' charts). If the note itself
+    // does not confidently identify the patient, HOLD it instead of misfiling.
     if (!pid) {
-      const store = await zapGet();
-      pid = store && store.selected_patient_id ? String(store.selected_patient_id) : '';
-      pname = (store && store.selected_patient_name) || '';
-      routed = 'selection';
+      const candidate = extractPatientName(note, title);
+      console.warn('note HELD (no confident patient match), NOT filed:', JSON.stringify({ title, candidate }));
+      return res.status(409).json({
+        error: 'no_confident_patient_match',
+        filed: false,
+        candidate,
+        hint: 'Note was not filed to avoid putting it on the wrong chart. Match/file it by hand.',
+      });
     }
-    if (!pid) return res.status(409).json({ error: 'no_patient_resolved' });
 
     const token = await getAccessToken();
     const pdf = await notePdf(title || `Note for ${pname}`, note);
