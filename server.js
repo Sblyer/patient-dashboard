@@ -49,6 +49,7 @@ async function storeHeldNote(item) {
     scheduleError: item.scheduleError || null,
     at: item.at,
     preview: String(item.note || '').slice(0, 240),
+    note: String(item.note || '').slice(0, 8000),
   });
   await zapSet({ held_notes: list.slice(0, 50) });
 }
@@ -287,6 +288,27 @@ app.get('/api/held', async (req, res) => {
   }
 });
 
+// File a held note onto a chosen patient's chart, then drop it from the held list.
+app.post('/api/file-held', async (req, res) => {
+  const { at, patientId, patientName } = req.body || {};
+  if (!patientId || !patientName) return res.status(400).json({ error: 'patient_required' });
+  let store = {};
+  try { store = await zapGet(); } catch (e) { return res.status(502).json({ error: 'storage_failed', detail: e.message }); }
+  const list = Array.isArray(store.held_notes) ? store.held_notes : [];
+  const idx = list.findIndex(x => x.at === at); // stable key, avoids index races
+  if (idx < 0) return res.status(404).json({ error: 'held_note_not_found' });
+  const item = list[idx];
+  try {
+    const document = await uploadNoteToChart({ pid: String(patientId), pname: patientName, title: item.title, note: item.note || item.preview || '' });
+    list.splice(idx, 1);
+    await zapSet({ held_notes: list });
+    res.json({ ok: true, filed: true, patient_name: patientName, remaining: list.length, document });
+  } catch (e) {
+    console.error('file-held upload failed:', e.status, e.detail || e.message);
+    res.status(502).json({ error: 'drchrono_upload_failed', status: e.status || 500, detail: e.detail || e.message });
+  }
+});
+
 app.get('/api/today', async (req, res) => {
   try {
     res.json(await fetchTodaysPatients());
@@ -325,6 +347,29 @@ function notePdf(title, body) {
     doc.fontSize(11).text(String(body || ''), { align: 'left' });
     doc.end();
   });
+}
+
+// Upload a note PDF to a specific patient's chart. Throws on failure with err.status/err.detail.
+async function uploadNoteToChart({ pid, pname, title, note }) {
+  const pdf = await notePdf(title || `Note for ${pname}`, note);
+  const mkForm = () => {
+    const form = new FormData();
+    form.append('patient', String(pid));
+    form.append('doctor', String(DRCHRONO_DOCTOR_ID));
+    form.append('date', todayInTz(DRCHRONO_TZ));
+    form.append('description', (title || 'Plaud note') + (pname ? ' - ' + pname : ''));
+    form.append('document', new Blob([pdf], { type: 'application/pdf' }), 'note.pdf');
+    return form;
+  };
+  let token = await getAccessToken();
+  let r = await fetch('https://app.drchrono.com/api/documents', { method: 'POST', headers: { Authorization: 'Bearer ' + token }, body: mkForm() });
+  if (r.status === 401) {
+    accessToken = null; token = await getAccessToken();
+    r = await fetch('https://app.drchrono.com/api/documents', { method: 'POST', headers: { Authorization: 'Bearer ' + token }, body: mkForm() });
+  }
+  const text = await r.text();
+  if (!r.ok) { const err = new Error('drchrono ' + r.status); err.status = r.status; err.detail = text.slice(0, 300); throw err; }
+  return JSON.parse(text || '{}');
 }
 
 // Upload a note straight onto the selected patient's chart in DrChrono.
@@ -387,21 +432,13 @@ app.post('/api/note', async (req, res) => {
       });
     }
 
-    const token = await getAccessToken();
-    const pdf = await notePdf(title || `Note for ${pname}`, note);
-    const form = new FormData();
-    form.append('patient', String(pid));
-    form.append('doctor', String(DRCHRONO_DOCTOR_ID));
-    form.append('date', todayInTz(DRCHRONO_TZ));
-    form.append('description', (title || 'Plaud note') + (pname ? ' - ' + pname : ''));
-    form.append('document', new Blob([pdf], { type: 'application/pdf' }), 'note.pdf');
-
-    let r = await fetch('https://app.drchrono.com/api/documents', { method: 'POST', headers: { Authorization: 'Bearer ' + token }, body: form });
-    if (r.status === 401) { accessToken = null; const t2 = await getAccessToken();
-      r = await fetch('https://app.drchrono.com/api/documents', { method: 'POST', headers: { Authorization: 'Bearer ' + t2 }, body: form }); }
-    const text = await r.text();
-    if (!r.ok) { console.error('note upload', r.status, text.slice(0, 200)); return res.status(502).json({ error: 'drchrono_upload_failed', status: r.status, detail: text.slice(0, 300) }); }
-    res.json({ ok: true, routed, patient_id: pid, patient_name: pname, document: JSON.parse(text || '{}') });
+    try {
+      const document = await uploadNoteToChart({ pid, pname, title, note });
+      res.json({ ok: true, routed, patient_id: pid, patient_name: pname, document });
+    } catch (e) {
+      console.error('note upload failed:', e.status, e.detail || e.message);
+      return res.status(502).json({ error: 'drchrono_upload_failed', status: e.status || 500, detail: e.detail || e.message });
+    }
   } catch (e) {
     console.error('POST /api/note:', e.message);
     res.status(500).json({ error: 'note_failed', detail: e.message });

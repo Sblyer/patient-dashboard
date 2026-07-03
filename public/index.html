@@ -48,6 +48,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .notice.info { background: #f0f0f0; color: #666; }
 .notice.warn { background: #fff4e5; color: #92400e; border: 1px solid #fde2b8; }
 .muted { padding: 24px 16px; text-align: center; color: #aaa; font-size: 14px; }
+.held-banner { margin: 0 16px 16px; background: #fff4e5; border: 1.5px solid #f59e0b; border-radius: 12px; padding: 14px 16px; display: none; }
+.held-banner.visible { display: block; }
+.held-head { font-size: 15px; font-weight: 700; color: #92400e; display: flex; align-items: center; gap: 8px; }
+.held-sub { font-size: 12.5px; color: #b45309; margin-top: 4px; line-height: 1.4; }
+.held-item { background: #fff; border: 1px solid #fde2b8; border-radius: 10px; padding: 10px 12px; margin-top: 10px; }
+.held-note-title { font-size: 13.5px; font-weight: 600; color: #1a1a1a; }
+.held-note-preview { font-size: 12px; color: #777; margin-top: 3px; line-height: 1.35; max-height: 52px; overflow: hidden; }
+.held-controls { display: flex; gap: 8px; margin-top: 10px; }
+.held-select { flex: 1; min-width: 0; padding: 10px; border: 1.5px solid #e5e5e5; border-radius: 10px; font-size: 14px; background: #fff; }
+.held-file-btn { padding: 10px 16px; border: none; border-radius: 10px; background: #f59e0b; color: #fff; font-weight: 600; font-size: 14px; cursor: pointer; white-space: nowrap; }
+.held-file-btn:disabled { opacity: 0.6; }
 </style>
 </head>
 <body>
@@ -67,6 +78,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     <div class="dot" id="status-dot"></div>
     <span class="status-text" id="status-text">Tap a patient before recording</span>
   </div>
+
+  <div class="held-banner" id="held-banner"></div>
 
   <div class="notice" id="notice"></div>
 
@@ -89,6 +102,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 <script>
 let selectedPatient = null;   // { id, name }
 let todaysPatients = [];      // [{ id, name }] from DrChrono
+let heldNotes = [];           // [{ at, title, candidate, preview, scheduleError }] awaiting manual filing
 
 const el = (id) => document.getElementById(id);
 el('date-display').textContent = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
@@ -163,6 +177,7 @@ async function loadSchedule() {
       showNotice("No patients on today's schedule yet. Add one in DrChrono, then tap Reload. You can also search a name to record without a chart match.", 'info');
     }
     search();
+    renderHeld(); // patient dropdowns in the held banner now have today's list
   } catch (e) {
     todaysPatients = [];
     el('patient-list').innerHTML = '';
@@ -224,8 +239,75 @@ function reset() {
   search();
 }
 
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function patientOptions() {
+  return todaysPatients.map(p =>
+    '<option value="' + esc(p.id) + '" data-name="' + esc(p.name) + '">' + esc(p.name) + '</option>').join('');
+}
+
+// The notification: a banner listing any note that couldn't be auto-matched, each
+// with a patient picker + File button, so a stuck note is a one-tap fix right here.
+function renderHeld() {
+  const b = el('held-banner');
+  if (!heldNotes.length) { b.className = 'held-banner'; b.innerHTML = ''; return; }
+  const n = heldNotes.length;
+  let html = '<div class="held-head">⚠️ ' + n + ' note' + (n > 1 ? 's' : '') + ' need filing</div>' +
+    '<div class="held-sub">These could not be auto-matched to a patient (nothing was put on a wrong chart). Pick the patient and tap File.</div>';
+  heldNotes.forEach((h, i) => {
+    const heard = h.candidate ? 'Heard: "' + esc(h.candidate) + '"'
+      : (h.scheduleError ? 'Schedule lookup failed' : 'No name detected');
+    const body = h.preview || h.note || '';
+    html += '<div class="held-item">' +
+      '<div class="held-note-title">' + esc(h.title || 'Plaud note') + '</div>' +
+      '<div class="held-note-preview">' + heard + (body ? ' — ' + esc(body) : '') + '</div>' +
+      '<div class="held-controls">' +
+        '<select class="held-select" id="held-sel-' + i + '"><option value="">Select patient…</option>' + patientOptions() + '</select>' +
+        '<button class="held-file-btn" id="held-btn-' + i + '" onclick="fileHeld(' + i + ')">File</button>' +
+      '</div></div>';
+  });
+  b.innerHTML = html;
+  b.className = 'held-banner visible';
+}
+
+async function loadHeld() {
+  try {
+    const r = await fetch('/api/held');
+    if (!r.ok) return;
+    const data = await r.json();
+    heldNotes = data.held || [];
+    renderHeld();
+  } catch (e) { /* non-fatal: the banner just won't show this cycle */ }
+}
+
+async function fileHeld(i) {
+  const sel = el('held-sel-' + i);
+  const btn = el('held-btn-' + i);
+  if (!sel || !btn) return;
+  const pid = sel.value;
+  if (!pid) { sel.focus(); return; }
+  const pname = sel.options[sel.selectedIndex].getAttribute('data-name');
+  const at = heldNotes[i] && heldNotes[i].at;
+  btn.textContent = '…'; btn.disabled = true;
+  try {
+    const r = await fetch('/api/file-held', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ at: at, patientId: pid, patientName: pname }),
+    });
+    if (!r.ok) throw new Error('status ' + r.status);
+    await loadHeld(); // reload so indices/list stay in sync after removal
+  } catch (e) {
+    btn.textContent = 'Retry'; btn.disabled = false;
+  }
+}
+
 el('search-input').addEventListener('input', search);
 loadSchedule();
+loadHeld();
+setInterval(loadHeld, 60000); // surface newly-held notes without a manual reload
 </script>
 </body>
 </html>
