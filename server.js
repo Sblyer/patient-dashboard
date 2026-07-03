@@ -38,6 +38,21 @@ async function zapSet(obj) {
   return r.json().catch(() => ({}));
 }
 
+// Append a held (unmatched) note so it is never silently lost. Kept small.
+async function storeHeldNote(item) {
+  let store = {};
+  try { store = await zapGet(); } catch (e) { /* start fresh if unreadable */ }
+  const list = Array.isArray(store.held_notes) ? store.held_notes : [];
+  list.unshift({
+    title: item.title || '',
+    candidate: item.candidate || '',
+    scheduleError: item.scheduleError || null,
+    at: item.at,
+    preview: String(item.note || '').slice(0, 240),
+  });
+  await zapSet({ held_notes: list.slice(0, 50) });
+}
+
 // ---------- DrChrono token management ----------
 // DrChrono rotates the refresh token on every refresh, so we persist the newest one
 // to Zapier Storage. Cold starts (Render free tier spins down) read the latest, never a
@@ -227,11 +242,50 @@ function matchPatient(candidate, patients) {
   return { match: null, reason: 'no_match', candidates: scored.slice(0, 3).map(x => x.p.name + ':' + x.s.toFixed(2)) };
 }
 
+// Reverse match: which scheduled patients are clearly named anywhere in the note
+// text. Format-independent (does not depend on Plaud's layout), and only reports a
+// patient when the evidence is strong: full name, first+last both present, or a
+// last name that is unique on that day's schedule. Used only when the forward
+// extraction did not already produce a confident match.
+function scanSchedule(text, patients) {
+  const t = ' ' + normName(text) + ' ';
+  if (!t.trim()) return [];
+  const lastCounts = {};
+  for (const p of patients) {
+    const parts = normName(p.name).split(' ').filter(Boolean);
+    const last = parts[parts.length - 1];
+    if (last) lastCounts[last] = (lastCounts[last] || 0) + 1;
+  }
+  const has = (w) => w && w.length >= 2 && t.includes(' ' + w + ' ');
+  const hits = [];
+  for (const p of patients) {
+    const parts = normName(p.name).split(' ').filter(Boolean);
+    if (!parts.length) continue;
+    const first = parts[0], last = parts[parts.length - 1];
+    let how = '';
+    if (parts.length >= 2 && t.includes(' ' + parts.join(' ') + ' ')) how = 'fullname';
+    else if (first && last && first !== last && has(first) && has(last)) how = 'first+last';
+    else if (last && last.length >= 4 && lastCounts[last] === 1 && has(last)) how = 'lastname';
+    if (how) hits.push({ p, how });
+  }
+  return hits;
+}
+
 // ---------- HTTP ----------
 const app = express();
 app.use(express.json());
 
 app.get('/healthz', (req, res) => res.json({ ok: true }));
+
+// Held (unmatched) notes, so nothing is ever silently lost — surfaced for manual filing.
+app.get('/api/held', async (req, res) => {
+  try {
+    const s = await zapGet();
+    res.json({ held: Array.isArray(s.held_notes) ? s.held_notes : [] });
+  } catch (e) {
+    res.status(502).json({ error: 'storage_failed', detail: e.message });
+  }
+});
 
 app.get('/api/today', async (req, res) => {
   try {
@@ -288,29 +342,48 @@ app.post('/api/note', async (req, res) => {
     // day's schedule, so every note routes to its own chart even when several are
     // synced at once. FALLBACK: the last tapped selection in Storage (old behavior),
     // so this can only improve on the previous result, never regress.
-    let pid = '', pname = '', routed = null;
+    let pid = '', pname = '', routed = null, scheduleError = null;
     try {
       const noteDate = parseNoteDate(title) || todayInTz(DRCHRONO_TZ);
       const { patients } = await fetchPatientsForDate(noteDate);
       const candidate = extractPatientName(note, title);
-      const result = matchPatient(candidate, patients);
-      if (result.match) { pid = String(result.match.id); pname = result.match.name; routed = 'name:' + result.reason; }
-      else { console.warn('note name-match fallback:', JSON.stringify({ candidate, date: noteDate, reason: result.reason, candidates: result.candidates })); }
+      // 1) FORWARD: the name Plaud stated, matched to the schedule.
+      const fwd = matchPatient(candidate, patients);
+      if (fwd.match) {
+        pid = String(fwd.match.id); pname = fwd.match.name; routed = 'name:' + fwd.reason;
+      } else {
+        // 2) REVERSE: which scheduled patient is actually named in the note text.
+        // Rescues the common case where Plaud's layout hides the name from the
+        // forward parser. Files only when exactly ONE scheduled patient is named,
+        // so it can never be forced onto the wrong chart.
+        const hits = scanSchedule(note + ' ' + (title || ''), patients);
+        const uniq = [...new Map(hits.map(h => [String(h.p.id), h])).values()];
+        if (uniq.length === 1) {
+          pid = String(uniq[0].p.id); pname = uniq[0].p.name; routed = 'scan:' + uniq[0].how;
+        } else {
+          console.warn('no confident match:', JSON.stringify({
+            candidate, date: noteDate, scheduleCount: patients.length,
+            fwdReason: fwd.reason, reverseHits: uniq.map(h => h.p.name),
+          }));
+        }
+      }
     } catch (e) {
-      console.error('schedule match failed, falling back to selection:', e.message);
+      scheduleError = e.message;
+      console.error('schedule/match failed:', e.message);
     }
-    // SAFETY: never fall back to the last tapped selection. A stale selection files
-    // the note onto the wrong patient when Plaud emails arrive batched or delayed
-    // (root cause of notes landing on other patients' charts). If the note itself
-    // does not confidently identify the patient, HOLD it instead of misfiling.
+    // SAFETY: never file onto the wrong chart. If we cannot confidently identify the
+    // patient (or the schedule lookup itself failed), HOLD the note — but persist it
+    // so it is never silently lost and can be surfaced for manual filing.
     if (!pid) {
       const candidate = extractPatientName(note, title);
-      console.warn('note HELD (no confident patient match), NOT filed:', JSON.stringify({ title, candidate }));
-      return res.status(409).json({
-        error: 'no_confident_patient_match',
-        filed: false,
-        candidate,
-        hint: 'Note was not filed to avoid putting it on the wrong chart. Match/file it by hand.',
+      try { await storeHeldNote({ title, note, candidate, scheduleError, at: new Date().toISOString() }); }
+      catch (e) { console.error('storeHeldNote failed:', e.message); }
+      console.warn('note HELD (not filed):', JSON.stringify({ title, candidate, scheduleError }));
+      return res.status(200).json({
+        filed: false, held: true, candidate, scheduleError,
+        hint: scheduleError
+          ? 'Schedule lookup failed, so the note was held (not filed to any chart).'
+          : 'No confident patient match, so the note was held for manual filing (never misfiled).',
       });
     }
 
