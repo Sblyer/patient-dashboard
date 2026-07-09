@@ -204,17 +204,37 @@ function parseNoteDate(title) {
 
 function extractPatientName(note, title) {
   const text = String(note || '');
-  // Primary: the structured "[patient]: Name" field Plaud emits in the summary.
+  const t = String(title || '');
+  // Primary: the structured "[patient]: Name" field older Plaud summaries emit.
   const m = text.match(/\[patient\][^\n:]*[:\-]+\s*([^\n\r]+)/i);
   if (m && m[1]) {
     const v = m[1].replace(/\[.*?\]/g, '').trim();
     if (v && !/^(not stated|unknown|n\/?a)$/i.test(v)) return v;
   }
-  // Fallback: name after the last colon in the subject ("... Care: Sandra").
-  const t = String(title || '');
+  // Narrative patterns used by current Plaud summaries (the [patient]: field is
+  // gone from recent formats): "The patient, Anisha Augustine, ...",
+  // "the patient's, Crystal Lewis (born ...", "@Patient (Jessica)", and
+  // "Consultation for Crystal Lewis" in the subject.
+  const NAME = "([A-Z][a-z]+(?:\\s+[A-Z][a-z'’.\\-]*[A-Za-z]){1,2})";
+  const patterns = [
+    new RegExp('@patient[^\\n(]*\\(\\s*([^)\\n]+?)\\s*\\)', 'i'),   // @Patient (Jessica)
+    new RegExp("patient(?:'s|’s)?,\\s*" + NAME, 'i'),               // The patient, Anisha Augustine,
+    new RegExp('\\bpatient,?\\s+' + NAME + '\\s*\\(', 'i'),         // patient Crystal Lewis (born
+    new RegExp('\\bfor\\s+(?:patient\\s+)?' + NAME, 'i'),           // Consultation for Crystal Lewis
+  ];
+  for (const re of patterns) {
+    const mm = text.match(re) || t.match(re);
+    if (mm && mm[1]) {
+      const v = mm[1].replace(/\[.*?\]/g, '').trim();
+      if (v && v.length <= 60 && !/^(not stated|unknown|n\/?a|the|a|patient)$/i.test(v)) return v;
+    }
+  }
+  // Last-resort subject fallback: name after a colon, but ONLY if it actually
+  // looks like a person's name (1-3 capitalized words), never a title phrase
+  // like "Diagnosing Post-Surgical Breast Discoloration".
   if (t.includes(':')) {
     const after = t.split(':').pop().trim();
-    if (after && after.length <= 60) return after;
+    if (/^[A-Z][a-z]+(\s+[A-Z][a-z]+){0,2}$/.test(after) && after.length <= 40) return after;
   }
   return '';
 }
@@ -267,6 +287,14 @@ function scanSchedule(text, patients) {
     if (parts.length >= 2 && t.includes(' ' + parts.join(' ') + ' ')) how = 'fullname';
     else if (first && last && first !== last && has(first) && has(last)) how = 'first+last';
     else if (last && last.length >= 4 && lastCounts[last] === 1 && has(last)) how = 'lastname';
+    else if (first && last && lastCounts[last] === 1 && has(first) && last.length >= 5) {
+      // Fuzzy last name: tolerate Plaud misspellings ("Augustine" vs schedule
+      // "Augustin") only when the first name is present and the last name is
+      // unique that day, so a garbled name can never land on the wrong chart.
+      for (const w of t.split(' ')) {
+        if (w.length >= 5 && simRatio(w, last) >= 0.85) { how = 'fuzzy_last'; break; }
+      }
+    }
     if (how) hits.push({ p, how });
   }
   return hits;
