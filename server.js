@@ -333,12 +333,16 @@ app.get('/api/held', async (req, res) => {
     const s = await zapGet();
     const held = (Array.isArray(s.held_notes) ? s.held_notes : []).map(h => {
       // Re-derive a suggested name for notes held before the extractor improved, so
-      // the filing box can pre-fill it (older items were stored with candidate '').
+      // the filing box can pre-select it (older items were stored with candidate '').
       let candidate = h.candidate;
       if (!candidate) {
         try { candidate = extractPatientName(h.note || h.preview || '', h.title || ''); } catch (e) { candidate = ''; }
       }
-      return { ...h, candidate: candidate || '' };
+      // The date the visit was recorded (from "[Plaud-AutoFlow] 07-09 ..."), so the
+      // filing picker can load THAT day's schedule — the patient is guaranteed to be
+      // on it — instead of today's (empty when the office is closed).
+      const noteDate = parseNoteDate(h.title || '') || (h.at ? String(h.at).slice(0, 10) : todayInTz(DRCHRONO_TZ));
+      return { ...h, candidate: candidate || '', noteDate };
     });
     res.json({ held });
   } catch (e) {
@@ -346,16 +350,26 @@ app.get('/api/held', async (req, res) => {
   }
 });
 
-// Search the full patient roster by name — powers the "file to any chart" picker so
-// held notes can be filed even when today's schedule is empty (office closed).
+// The schedule for any given day, so a held note can be filed from the day it was
+// recorded (reliable and small) rather than only today's list.
+app.get('/api/schedule', async (req, res) => {
+  const date = String(req.query.date || '').match(/^\d{4}-\d{2}-\d{2}$/) ? req.query.date : todayInTz(DRCHRONO_TZ);
+  try {
+    res.json(await fetchPatientsForDate(date));
+  } catch (e) {
+    console.error('GET /api/schedule:', e.message);
+    res.status(502).json({ error: 'schedule_unavailable', detail: e.message });
+  }
+});
+
+// Best-effort roster search (any chart, any day) as a fallback for the rare note
+// whose patient was not on that day's schedule (walk-in, mis-dated recording).
 app.get('/api/patients/search', async (req, res) => {
   const q = normName(req.query.q || '');
   if (q.length < 2) return res.json({ patients: [] });
   try {
     const all = await allPatients();
-    const matches = all
-      .filter(p => normName(p.name).includes(q))
-      .slice(0, 25);
+    const matches = all.filter(p => normName(p.name).includes(q)).slice(0, 25);
     res.json({ patients: matches });
   } catch (e) {
     console.error('GET /api/patients/search:', e.message);

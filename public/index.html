@@ -56,6 +56,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .held-note-title { font-size: 13.5px; font-weight: 600; color: #1a1a1a; }
 .held-note-preview { font-size: 12px; color: #777; margin-top: 3px; line-height: 1.35; max-height: 52px; overflow: hidden; }
 .held-controls { display: flex; gap: 8px; margin-top: 10px; }
+.held-daylabel { font-size: 11.5px; color: #b45309; margin-top: 8px; font-weight: 600; }
 .held-search { width: 100%; padding: 10px 12px; border: 1.5px solid #e5e5e5; border-radius: 10px; font-size: 14px; background: #fff; outline: none; -webkit-appearance: none; }
 .held-search:focus { border-color: #f59e0b; }
 .held-select { flex: 1; min-width: 0; padding: 10px; border: 1.5px solid #e5e5e5; border-radius: 10px; font-size: 14px; background: #fff; }
@@ -263,43 +264,89 @@ function renderHeld() {
     const heard = h.candidate ? 'Heard: "' + esc(h.candidate) + '"'
       : (h.scheduleError ? 'Schedule lookup failed' : 'No name detected');
     const body = h.preview || h.note || '';
-    const suggest = (h.candidate || '').split('(')[0].trim();
+    const dateLabel = h.noteDate ? 'From ' + esc(h.noteDate) + ' schedule' : "From the schedule";
     html += '<div class="held-item">' +
       '<div class="held-note-title">' + esc(h.title || 'Plaud note') + '</div>' +
       '<div class="held-note-preview">' + heard + (body ? ' — ' + esc(body) : '') + '</div>' +
+      '<div class="held-daylabel" id="held-day-' + i + '">' + dateLabel + '</div>' +
       '<div class="held-controls">' +
-        '<input class="held-search" id="held-q-' + i + '" placeholder="Search any patient name…" value="' + esc(suggest) + '" autocomplete="off" autocorrect="off" spellcheck="false" oninput="searchHeldPatients(' + i + ')">' +
+        '<select class="held-select" id="held-sel-' + i + '"><option value="">Loading…</option></select>' +
+        '<button class="held-file-btn" id="held-btn-' + i + '" onclick="fileHeld(' + i + ')">File</button>' +
       '</div>' +
       '<div class="held-controls">' +
-        '<select class="held-select" id="held-sel-' + i + '"><option value="">Select patient…</option></select>' +
-        '<button class="held-file-btn" id="held-btn-' + i + '" onclick="fileHeld(' + i + ')">File</button>' +
+        '<input class="held-search" id="held-q-' + i + '" placeholder="Not there? search all patients…" autocomplete="off" autocorrect="off" spellcheck="false" oninput="searchHeldPatients(' + i + ')">' +
       '</div></div>';
   });
   b.innerHTML = html;
   b.className = 'held-banner visible';
-  // Pre-fill each picker by searching the suggested name against the full roster,
-  // so a stuck note is usually a single tap of File.
-  heldNotes.forEach((h, i) => { if ((h.candidate || '').trim()) searchHeldPatients(i); });
+  // Populate each picker from the day the note was recorded, then pre-select the
+  // patient the name points to so filing is usually one tap.
+  heldNotes.forEach((h, i) => loadHeldDay(i, h.noteDate, h.candidate));
+}
+
+function optionsHtml(patients) {
+  return ['<option value="">Select patient…</option>'].concat(
+    patients.map(p => '<option value="' + esc(p.id) + '" data-name="' + esc(p.name) + '">' + esc(p.name) + '</option>')
+  ).join('');
+}
+
+function normC(s) { return String(s || '').toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim(); }
+
+// Pick the scheduled patient a suggested name most likely refers to. Only returns a
+// confident single match; tolerates Plaud's spelling ("Augustine" vs "Augustin").
+function bestOption(cand, patients) {
+  const c = normC(cand); if (!c) return null;
+  const exact = patients.find(p => normC(p.name) === c); if (exact) return exact;
+  const contains = patients.find(p => { const n = normC(p.name); return n.includes(c) || c.includes(n); }); if (contains) return contains;
+  const cf = c.split(' ')[0], cl = c.split(' ').pop();
+  const firstHits = patients.filter(p => normC(p.name).split(' ')[0] === cf);
+  if (firstHits.length === 1) return firstHits[0];
+  const fuzzy = patients.find(p => { const parts = normC(p.name).split(' '); return parts[0] === cf && parts[parts.length - 1].slice(0, 4) === cl.slice(0, 4); });
+  return fuzzy || null;
+}
+
+const heldDaySchedules = {}; // i -> [{id,name}] for restoring after a broad search
+async function loadHeldDay(i, date, candidate) {
+  const sel = el('held-sel-' + i);
+  if (!sel) return;
+  try {
+    const r = await fetch('/api/schedule?date=' + encodeURIComponent(date || ''));
+    const data = r.ok ? await r.json() : { patients: [] };
+    const patients = data.patients || [];
+    heldDaySchedules[i] = patients;
+    if (!patients.length) {
+      sel.innerHTML = '<option value="">Select patient…</option>';
+      const lbl = el('held-day-' + i); if (lbl) lbl.textContent = "That day's schedule was empty, use search below.";
+      return;
+    }
+    sel.innerHTML = optionsHtml(patients);
+    const best = bestOption(candidate, patients);
+    if (best) {
+      const opt = Array.from(sel.options).find(o => o.value === String(best.id));
+      if (opt) opt.selected = true;
+    }
+  } catch (e) {
+    sel.innerHTML = '<option value="">Select patient…</option>';
+  }
 }
 
 const heldTimers = {};
+// Fallback only: search the whole roster for a note whose patient was not on that
+// day's schedule. Empty query restores that day's schedule list.
 async function searchHeldPatients(i) {
   const inp = el('held-q-' + i);
   const sel = el('held-sel-' + i);
   if (!inp || !sel) return;
   const q = inp.value.trim();
   clearTimeout(heldTimers[i]);
-  if (q.length < 2) { sel.innerHTML = '<option value="">Select patient…</option>'; return; }
+  if (q.length < 2) { sel.innerHTML = optionsHtml(heldDaySchedules[i] || []); return; }
   heldTimers[i] = setTimeout(async () => {
     try {
       const r = await fetch('/api/patients/search?q=' + encodeURIComponent(q));
       if (!r.ok) return;
       const data = await r.json();
-      const opts = ['<option value="">Select patient…</option>'].concat(
-        (data.patients || []).map(p =>
-          '<option value="' + esc(p.id) + '" data-name="' + esc(p.name) + '">' + esc(p.name) + '</option>'));
-      sel.innerHTML = opts.join('');
-      if ((data.patients || []).length === 1) sel.selectedIndex = 1; // exact single hit → ready to File
+      sel.innerHTML = optionsHtml(data.patients || []);
+      if ((data.patients || []).length === 1) sel.selectedIndex = 1;
     } catch (e) { /* leave the picker as-is on a transient error */ }
   }, 300);
 }
