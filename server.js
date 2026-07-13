@@ -157,6 +157,27 @@ async function fetchPatientsForDate(date) {
 
 async function fetchTodaysPatients() { return fetchPatientsForDate(todayInTz(DRCHRONO_TZ)); }
 
+// Full patient roster (all charts, not just today's schedule) so a held note can be
+// filed to ANY patient — critical when the office is closed and today's schedule is
+// empty. Cached in memory (~10 min) since the roster changes slowly.
+let patientCache = { at: 0, list: [] };
+async function allPatients() {
+  if (patientCache.list.length && Date.now() - patientCache.at < 10 * 60 * 1000) return patientCache.list;
+  const list = [];
+  let next = `${API}/patients_summary?verbose=false`;
+  let guard = 0;
+  while (next && guard++ < 200) {
+    const page = await drGet(next);
+    for (const p of (page.results || [])) {
+      const name = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
+      if (name) list.push({ id: p.id, name });
+    }
+    next = page.next;
+  }
+  if (list.length) patientCache = { at: Date.now(), list };
+  return list.length ? list : patientCache.list;
+}
+
 // ---------- Patient name matching ----------
 // Plaud names the patient in every note ("[patient]: Sandra" in the summary, and
 // after the colon in the subject). Matching that to the day's schedule lets each
@@ -310,9 +331,35 @@ app.get('/healthz', (req, res) => res.json({ ok: true }));
 app.get('/api/held', async (req, res) => {
   try {
     const s = await zapGet();
-    res.json({ held: Array.isArray(s.held_notes) ? s.held_notes : [] });
+    const held = (Array.isArray(s.held_notes) ? s.held_notes : []).map(h => {
+      // Re-derive a suggested name for notes held before the extractor improved, so
+      // the filing box can pre-fill it (older items were stored with candidate '').
+      let candidate = h.candidate;
+      if (!candidate) {
+        try { candidate = extractPatientName(h.note || h.preview || '', h.title || ''); } catch (e) { candidate = ''; }
+      }
+      return { ...h, candidate: candidate || '' };
+    });
+    res.json({ held });
   } catch (e) {
     res.status(502).json({ error: 'storage_failed', detail: e.message });
+  }
+});
+
+// Search the full patient roster by name — powers the "file to any chart" picker so
+// held notes can be filed even when today's schedule is empty (office closed).
+app.get('/api/patients/search', async (req, res) => {
+  const q = normName(req.query.q || '');
+  if (q.length < 2) return res.json({ patients: [] });
+  try {
+    const all = await allPatients();
+    const matches = all
+      .filter(p => normName(p.name).includes(q))
+      .slice(0, 25);
+    res.json({ patients: matches });
+  } catch (e) {
+    console.error('GET /api/patients/search:', e.message);
+    res.status(502).json({ error: 'patient_search_failed', detail: e.message });
   }
 });
 
