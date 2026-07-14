@@ -305,28 +305,37 @@ function bestOption(cand, patients) {
   return fuzzy || null;
 }
 
-const heldDaySchedules = {}; // i -> [{id,name}] for restoring after a broad search
+const heldDaySchedules = {}; // i -> [{id,name}] merged pool (note-day + today) for the picker
 async function loadHeldDay(i, date, candidate) {
   const sel = el('held-sel-' + i);
   if (!sel) return;
-  try {
-    const r = await fetch('/api/schedule?date=' + encodeURIComponent(date || ''));
-    const data = r.ok ? await r.json() : { patients: [] };
-    const patients = data.patients || [];
-    heldDaySchedules[i] = patients;
-    if (!patients.length) {
-      sel.innerHTML = '<option value="">Select patient…</option>';
-      const lbl = el('held-day-' + i); if (lbl) lbl.textContent = "That day's schedule was empty, use search below.";
-      return;
-    }
-    sel.innerHTML = optionsHtml(patients);
-    const best = bestOption(candidate, patients);
-    if (best) {
-      const opt = Array.from(sel.options).find(o => o.value === String(best.id));
-      if (opt) opt.selected = true;
-    }
-  } catch (e) {
+  // Fetch this note's own-day schedule (one quick retry for a transient empty),
+  // then MERGE with today's already-loaded schedule so the picker is never blank.
+  let day = [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await fetch('/api/schedule?date=' + encodeURIComponent(date || ''));
+      if (r.ok) { const d = await r.json(); day = d.patients || []; if (day.length) break; }
+    } catch (e) { /* retry */ }
+  }
+  const map = new Map();
+  [...day, ...(todaysPatients || [])].forEach(p => { if (p && p.id != null) map.set(String(p.id), p); });
+  const patients = [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
+  heldDaySchedules[i] = patients;
+  const lbl = el('held-day-' + i);
+  if (!patients.length) {
     sel.innerHTML = '<option value="">Select patient…</option>';
+    if (lbl) lbl.textContent = "No schedule loaded — type a name below to search.";
+    return;
+  }
+  if (lbl) lbl.textContent = day.length
+    ? ('From ' + esc(date) + " + today's schedule")
+    : "That day's list was empty — showing today's, or search below.";
+  sel.innerHTML = optionsHtml(patients);
+  const best = bestOption(candidate, patients);
+  if (best) {
+    const opt = Array.from(sel.options).find(o => o.value === String(best.id));
+    if (opt) opt.selected = true;
   }
 }
 
