@@ -74,7 +74,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 
   <div class="search-box">
     <span class="search-icon">🔍</span>
-    <input type="text" class="search-input" id="search-input" placeholder="Search today's patients..." autocomplete="off" autocorrect="off" spellcheck="false">
+    <input type="text" class="search-input" id="search-input" placeholder="Search any patient..." autocomplete="off" autocorrect="off" spellcheck="false">
   </div>
 
   <div class="status-bar">
@@ -151,19 +151,44 @@ function filtered() {
   return todaysPatients.filter(p => p.name.toLowerCase().includes(q));
 }
 
+let rosterTimer = null;
 function search() {
   const q = el('search-input').value.trim();
-  const list = filtered();
-  el('section-label-text').textContent = q ? (list.length ? 'Matching patients' : 'No matches found') : "Today's schedule";
-  renderList(list);
+  const todayHits = filtered();
+  renderList(todayHits);
+  el('add-new-btn').classList.remove('visible');
+  clearTimeout(rosterTimer);
+  if (!q) { el('section-label-text').textContent = "Today's schedule"; return; }
+  el('section-label-text').textContent = todayHits.length
+    ? 'Matching patients'
+    : (q.length >= 2 ? 'Searching all patients…' : 'No matches yet');
+  // Today's list is instant. For anything not on today's schedule, search the full
+  // roster so any patient is findable from this one box (debounced).
+  if (q.length >= 2) rosterTimer = setTimeout(() => searchAllPatients(q, todayHits), 300);
+}
 
-  // Manual add fallback: lets you record for someone not on today's pulled list.
-  const addBtn = el('add-new-btn');
-  if (q.length >= 2 && !list.some(p => p.name.toLowerCase() === q.toLowerCase())) {
-    addBtn.textContent = '+ Use "' + titleCase(q) + '" (name only, no chart match)';
-    addBtn.classList.add('visible');
-  } else {
-    addBtn.classList.remove('visible');
+// Merge today's matches with full-roster matches and render them all as tappable
+// cards. Shows a clear result / empty / error state instead of silently doing nothing.
+async function searchAllPatients(q, todayHits) {
+  try {
+    const r = await fetch('/api/patients/search?q=' + encodeURIComponent(q));
+    if (el('search-input').value.trim() !== q) return; // a newer keystroke won
+    if (!r.ok) { el('section-label-text').textContent = "Couldn't search patients — tap Reload"; return; }
+    const data = await r.json();
+    const seen = new Set(todayHits.map(p => String(p.id)));
+    const merged = todayHits.concat((data.patients || []).filter(p => !seen.has(String(p.id))));
+    renderList(merged);
+    el('section-label-text').textContent = merged.length ? 'Matching patients' : 'No patient found';
+    // Only offer the name-only record when the ENTIRE roster has no match.
+    const addBtn = el('add-new-btn');
+    if (!merged.length) {
+      addBtn.textContent = '+ Use "' + titleCase(q) + '" (name only, no chart match)';
+      addBtn.classList.add('visible');
+    } else {
+      addBtn.classList.remove('visible');
+    }
+  } catch (e) {
+    if (el('search-input').value.trim() === q) el('section-label-text').textContent = "Couldn't search — check connection";
   }
 }
 
@@ -345,18 +370,29 @@ const heldTimers = {};
 async function searchHeldPatients(i) {
   const inp = el('held-q-' + i);
   const sel = el('held-sel-' + i);
+  const lbl = el('held-day-' + i);
   if (!inp || !sel) return;
   const q = inp.value.trim();
   clearTimeout(heldTimers[i]);
-  if (q.length < 2) { sel.innerHTML = optionsHtml(heldDaySchedules[i] || []); return; }
+  if (q.length < 2) {
+    sel.innerHTML = optionsHtml(heldDaySchedules[i] || []);
+    if (lbl) lbl.textContent = "That day's list was empty — showing today's, or search above.";
+    return;
+  }
+  if (lbl) lbl.textContent = 'Searching all patients…';
   heldTimers[i] = setTimeout(async () => {
     try {
       const r = await fetch('/api/patients/search?q=' + encodeURIComponent(q));
-      if (!r.ok) return;
+      if (inp.value.trim() !== q) return; // superseded by a newer keystroke
+      if (!r.ok) { if (lbl) lbl.textContent = "Couldn't search — try again."; return; }
       const data = await r.json();
-      sel.innerHTML = optionsHtml(data.patients || []);
-      if ((data.patients || []).length === 1) sel.selectedIndex = 1;
-    } catch (e) { /* leave the picker as-is on a transient error */ }
+      const found = data.patients || [];
+      sel.innerHTML = optionsHtml(found);
+      if (found.length === 1) sel.selectedIndex = 1;
+      if (lbl) lbl.textContent = found.length
+        ? (found.length + ' patient' + (found.length > 1 ? 's' : '') + ' found — pick from the dropdown ↑')
+        : 'No patient found for "' + q + '".';
+    } catch (e) { if (lbl) lbl.textContent = "Couldn't search — check connection."; }
   }, 300);
 }
 
