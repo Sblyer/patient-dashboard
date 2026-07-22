@@ -109,17 +109,29 @@ async function getAccessToken() {
   return refreshing;
 }
 
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
 async function drGet(urlOrPath) {
   const url = urlOrPath.startsWith('http') ? urlOrPath : API + urlOrPath;
-  let token = await getAccessToken();
-  let r = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
-  if (r.status === 401) {
-    accessToken = null; // force one refresh and retry
-    token = await getAccessToken();
-    r = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
+  let lastStatus = 0, lastBody = '';
+  // Retry transient failures. A freshly minted DrChrono token can briefly 401 on
+  // patient endpoints before it propagates (seen on cold starts / after a refresh),
+  // and the free host cold-starts too — so back off and retry instead of failing the
+  // whole schedule/search on the first blip.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const token = await getAccessToken();
+    const r = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
+    if (r.ok) return r.json();
+    lastStatus = r.status;
+    lastBody = (await r.text()).slice(0, 200);
+    if (r.status === 401) accessToken = null; // force a fresh token next attempt
+    if (r.status === 401 || r.status === 429 || r.status >= 500) {
+      await sleep(500 * (attempt + 1)); // 0.5s, 1s, 1.5s: let the token/API settle
+      continue;
+    }
+    break; // 4xx other than 401/429 is not transient
   }
-  if (!r.ok) throw new Error('drchrono ' + r.status + ' ' + (await r.text()).slice(0, 200));
-  return r.json();
+  throw new Error('drchrono ' + lastStatus + ' ' + lastBody);
 }
 
 function todayInTz(tz) {
