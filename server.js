@@ -173,18 +173,29 @@ async function fetchTodaysPatients() { return fetchPatientsForDate(todayInTz(DRC
 // filed to ANY patient — critical when the office is closed and today's schedule is
 // empty. Cached in memory (~10 min) since the roster changes slowly.
 let patientCache = { at: 0, list: [] };
+// The roster changes slowly (a few new charts a day), but paginating the whole
+// thing on every search is what trips DrChrono's rate limit (429) after a cold
+// start. Cache it for 6h so we fetch it at most a handful of times a day.
+const ROSTER_TTL = 6 * 60 * 60 * 1000;
 async function allPatients() {
-  if (patientCache.list.length && Date.now() - patientCache.at < 10 * 60 * 1000) return patientCache.list;
+  if (patientCache.list.length && Date.now() - patientCache.at < ROSTER_TTL) return patientCache.list;
   const list = [];
   let next = `${API}/patients_summary?verbose=false`;
   let guard = 0;
-  while (next && guard++ < 200) {
-    const page = await drGet(next);
-    for (const p of (page.results || [])) {
-      const name = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
-      if (name) list.push({ id: p.id, name });
+  try {
+    while (next && guard++ < 200) {
+      const page = await drGet(next);
+      for (const p of (page.results || [])) {
+        const name = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
+        if (name) list.push({ id: p.id, name });
+      }
+      next = page.next;
     }
-    next = page.next;
+  } catch (e) {
+    // Throttled (429) or a transient failure mid-fetch: serve the last good roster
+    // rather than failing search entirely. Better a slightly stale list than none.
+    if (patientCache.list.length) return patientCache.list;
+    throw e;
   }
   if (list.length) patientCache = { at: Date.now(), list };
   return list.length ? list : patientCache.list;

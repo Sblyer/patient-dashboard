@@ -1,0 +1,26 @@
+name: keep-warm
+
+# Render's free plan spins the service down after ~15 min of inactivity, and a
+# cold start takes ~12s (the app looks "dead" while it wakes). This pings the
+# health endpoint every 10 minutes during clinic hours (7am–7pm ET, Mon–Fri) so
+# the dashboard is always instant when Scott opens it. Costs nothing.
+on:
+  schedule:
+    # every 10 min, 11:00–23:59 UTC (~7am–7pm ET), Monday–Friday
+    - cron: '*/10 11-23 * * 1-5'
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /healthz to keep the service warm
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 https://patient-dashboard-zmqz.onrender.com/healthz)
+            echo "attempt $i: HTTP $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 20
+          done
+          echo "service did not return 200 after 3 attempts"
+          exit 1
