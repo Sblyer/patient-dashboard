@@ -174,11 +174,23 @@ async function fetchTodaysPatients() { return fetchPatientsForDate(todayInTz(DRC
 // empty. Cached in memory (~10 min) since the roster changes slowly.
 let patientCache = { at: 0, list: [] };
 // The roster changes slowly (a few new charts a day), but paginating the whole
-// thing on every search is what trips DrChrono's rate limit (429) after a cold
-// start. Cache it for 6h so we fetch it at most a handful of times a day.
+// thing on every search is what trips DrChrono's rate limit (500/hr, 290/10min)
+// after a restart. So: cache in memory 6h, back it with a durable copy in Zapier
+// Storage that survives cold starts, and only crawl DrChrono when both are stale.
 const ROSTER_TTL = 6 * 60 * 60 * 1000;
 async function allPatients() {
-  if (patientCache.list.length && Date.now() - patientCache.at < ROSTER_TTL) return patientCache.list;
+  const now = Date.now();
+  if (patientCache.list.length && now - patientCache.at < ROSTER_TTL) return patientCache.list;
+
+  // Durable copy survives restarts so a fresh instance doesn't re-crawl DrChrono.
+  try {
+    const store = await zapGet();
+    if (Array.isArray(store.patient_roster) && store.roster_at && now - store.roster_at < ROSTER_TTL) {
+      patientCache = { at: store.roster_at, list: store.patient_roster };
+      return patientCache.list;
+    }
+  } catch (e) { /* storage unreadable — fall through to a live crawl */ }
+
   const list = [];
   let next = `${API}/patients_summary?verbose=false`;
   let guard = 0;
@@ -192,12 +204,25 @@ async function allPatients() {
       next = page.next;
     }
   } catch (e) {
-    // Throttled (429) or a transient failure mid-fetch: serve the last good roster
-    // rather than failing search entirely. Better a slightly stale list than none.
+    // Throttled (429) or a transient failure mid-crawl: serve the last good roster
+    // (memory, then the durable copy) rather than failing search entirely.
     if (patientCache.list.length) return patientCache.list;
+    try {
+      const store = await zapGet();
+      if (Array.isArray(store.patient_roster) && store.patient_roster.length) {
+        patientCache = { at: store.roster_at || now, list: store.patient_roster };
+        return patientCache.list;
+      }
+    } catch (_) { /* nothing durable to fall back to */ }
     throw e;
   }
-  if (list.length) patientCache = { at: Date.now(), list };
+
+  if (list.length) {
+    patientCache = { at: now, list };
+    // Best-effort durable cache (merges, so it won't touch held_notes / the token).
+    // A very large roster could exceed storage limits, so tolerate a rejection.
+    zapSet({ patient_roster: list, roster_at: now }).catch((e) => console.error('roster persist skipped:', e.message));
+  }
   return list.length ? list : patientCache.list;
 }
 
