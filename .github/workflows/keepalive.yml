@@ -6,8 +6,10 @@ name: keep-warm
 # the dashboard is always instant when Scott opens it. Costs nothing.
 on:
   schedule:
-    # every 10 min, 11:00–23:59 UTC (~7am–7pm ET), Monday–Friday
-    - cron: '*/10 11-23 * * 1-5'
+    # every 10 min, every day. Scott uses it on weekends and evenings too, and a
+    # spun-down free-tier cold start (+ first roster crawl) is what made search look
+    # dead. Keeping it warm 24/7 is cheap (~6s per run) and keeps search instant.
+    - cron: '*/10 * * * *'
   workflow_dispatch: {}
 
 jobs:

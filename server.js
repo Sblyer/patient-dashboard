@@ -173,34 +173,40 @@ async function fetchTodaysPatients() { return fetchPatientsForDate(todayInTz(DRC
 // filed to ANY patient — critical when the office is closed and today's schedule is
 // empty. Cached in memory (~10 min) since the roster changes slowly.
 let patientCache = { at: 0, list: [] };
+let rosterInFlight = null; // dedupe concurrent crawls (page-load + first search) into one
 // Paginating the whole roster (DrChrono caps at 50/page) on every search is what
 // tripped the rate limit (500/hr, 290/10min): the old 10-min cache meant a fresh
 // full crawl several times an hour. A single crawl is only ~a few dozen calls and
 // is safe; the damage was doing it repeatedly. Cache 6h so we crawl at most a few
-// times a day, and serve the last-good roster if a crawl is throttled.
+// times a day, and serve the last-good roster if a crawl is throttled. The roster is
+// also warmed at startup (see bottom) so the first search is instant after a cold start.
 const ROSTER_TTL = 6 * 60 * 60 * 1000;
 async function allPatients() {
   if (patientCache.list.length && Date.now() - patientCache.at < ROSTER_TTL) return patientCache.list;
-  const list = [];
-  let next = `${API}/patients_summary?verbose=false`;
-  let guard = 0;
-  try {
-    while (next && guard++ < 200) {
-      const page = await drGet(next);
-      for (const p of (page.results || [])) {
-        const name = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
-        if (name) list.push({ id: p.id, name });
+  if (rosterInFlight) return rosterInFlight; // a crawl is already running — share it
+  rosterInFlight = (async () => {
+    const list = [];
+    let next = `${API}/patients_summary?verbose=false`;
+    let guard = 0;
+    try {
+      while (next && guard++ < 200) {
+        const page = await drGet(next);
+        for (const p of (page.results || [])) {
+          const name = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
+          if (name) list.push({ id: p.id, name });
+        }
+        next = page.next;
       }
-      next = page.next;
+    } catch (e) {
+      // Throttled (429) or a transient failure mid-crawl: serve the last good roster
+      // rather than failing search entirely. Better a slightly stale list than none.
+      if (patientCache.list.length) return patientCache.list;
+      throw e;
     }
-  } catch (e) {
-    // Throttled (429) or a transient failure mid-crawl: serve the last good roster
-    // rather than failing search entirely. Better a slightly stale list than none.
-    if (patientCache.list.length) return patientCache.list;
-    throw e;
-  }
-  if (list.length) patientCache = { at: Date.now(), list };
-  return list.length ? list : patientCache.list;
+    if (list.length) patientCache = { at: Date.now(), list };
+    return list.length ? list : patientCache.list;
+  })().finally(() => { rosterInFlight = null; });
+  return rosterInFlight;
 }
 
 // ---------- Patient name matching ----------
@@ -561,4 +567,12 @@ app.post('/api/note', async (req, res) => {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-app.listen(PORT, () => console.log('patient-dashboard listening on :' + PORT));
+app.listen(PORT, () => {
+  console.log('patient-dashboard listening on :' + PORT);
+  // Warm the patient roster in the background so the first search is instant even
+  // right after a cold start (Render free tier spins the service down). Deduped via
+  // rosterInFlight, so a user searching at the same moment shares this one crawl.
+  allPatients()
+    .then((l) => console.log('roster warmed:', l.length, 'patients'))
+    .catch((e) => console.error('roster warm failed (will retry on first search):', e.message));
+});
