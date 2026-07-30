@@ -170,8 +170,14 @@ function search() {
 // Merge today's matches with full-roster matches and render them all as tappable
 // cards. Shows a clear result / empty / error state instead of silently doing nothing.
 async function searchAllPatients(q, todayHits) {
+  // Same cold-start caveat as loadSchedule: if the roster fetch is slow, the app is
+  // likely waking up — say so instead of leaving "Searching…" up long enough to look dead.
+  const wake = setTimeout(() => {
+    if (el('search-input').value.trim() === q) el('section-label-text').textContent = 'Waking the app up — one moment…';
+  }, 2500);
   try {
     const r = await fetch('/api/patients/search?q=' + encodeURIComponent(q));
+    clearTimeout(wake);
     if (el('search-input').value.trim() !== q) return; // a newer keystroke won
     if (!r.ok) { el('section-label-text').textContent = "Couldn't search patients — tap Reload"; return; }
     const data = await r.json();
@@ -188,6 +194,7 @@ async function searchAllPatients(q, todayHits) {
       addBtn.classList.remove('visible');
     }
   } catch (e) {
+    clearTimeout(wake);
     if (el('search-input').value.trim() === q) el('section-label-text').textContent = "Couldn't search — check connection";
   }
 }
@@ -196,8 +203,17 @@ async function loadSchedule() {
   hideNotice();
   el('section-label-text').textContent = "Today's schedule";
   el('patient-list').innerHTML = '<div class="muted">Loading today\'s schedule…</div>';
+  // Free-tier hosting spins the app down after ~15 min idle; the first request then has
+  // to cold-start (can take up to a minute) before anything comes back. Say it's waking
+  // up instead of looking frozen, and retry once so a dropped cold-start connection heals.
+  const wake = setTimeout(() => {
+    el('patient-list').innerHTML = '<div class="muted">Waking the app up — the first load can take up to a minute if it\'s been idle. Hang tight…</div>';
+  }, 3000);
   try {
-    const r = await fetch('/api/today');
+    let r;
+    try { r = await fetch('/api/today'); }
+    catch (e1) { r = await fetch('/api/today'); } // one retry: a cold start can drop the first connection
+    clearTimeout(wake);
     if (!r.ok) throw new Error('status ' + r.status);
     const data = await r.json();
     todaysPatients = (data.patients || []);
@@ -207,6 +223,7 @@ async function loadSchedule() {
     search();
     renderHeld(); // patient dropdowns in the held banner now have today's list
   } catch (e) {
+    clearTimeout(wake);
     todaysPatients = [];
     el('patient-list').innerHTML = '';
     showNotice("Couldn't load today's schedule. Tap Reload to retry, or search a name to record without a chart match.", 'warn');
