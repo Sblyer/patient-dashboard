@@ -184,7 +184,12 @@ async function searchAllPatients(q, todayHits) {
     const seen = new Set(todayHits.map(p => String(p.id)));
     const merged = todayHits.concat((data.patients || []).filter(p => !seen.has(String(p.id))));
     renderList(merged);
-    el('section-label-text').textContent = merged.length ? 'Matching patients' : 'No patient found';
+    // Say so when the list is capped, so a common surname never looks like the full answer.
+    el('section-label-text').textContent = !merged.length
+      ? 'No patient found'
+      : (data.truncated
+        ? 'First ' + merged.length + ' of ' + data.total + ' — type more of the name'
+        : 'Matching patients');
     // Only offer the name-only record when the ENTIRE roster has no match.
     const addBtn = el('add-new-btn');
     if (!merged.length) {
@@ -406,9 +411,11 @@ async function searchHeldPatients(i) {
       const found = data.patients || [];
       sel.innerHTML = optionsHtml(found);
       if (found.length === 1) sel.selectedIndex = 1;
-      if (lbl) lbl.textContent = found.length
-        ? (found.length + ' patient' + (found.length > 1 ? 's' : '') + ' found — pick from the dropdown ↑')
-        : 'No patient found for "' + q + '".';
+      if (lbl) lbl.textContent = !found.length
+        ? 'No patient found for "' + q + '".'
+        : (data.truncated
+          ? 'First ' + found.length + ' of ' + data.total + ' — type more of the name, then pick ↑'
+          : found.length + ' patient' + (found.length > 1 ? 's' : '') + ' found — pick from the dropdown ↑');
     } catch (e) { if (lbl) lbl.textContent = "Couldn't search — check connection."; }
   }, 300);
 }

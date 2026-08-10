@@ -169,44 +169,97 @@ async function fetchPatientsForDate(date) {
 
 async function fetchTodaysPatients() { return fetchPatientsForDate(todayInTz(DRCHRONO_TZ)); }
 
-// Full patient roster (all charts, not just today's schedule) so a held note can be
-// filed to ANY patient — critical when the office is closed and today's schedule is
-// empty. Cached in memory (~10 min) since the roster changes slowly.
-let patientCache = { at: 0, list: [] };
-let rosterInFlight = null; // dedupe concurrent crawls (page-load + first search) into one
-// Paginating the whole roster (DrChrono caps at 50/page) on every search is what
-// tripped the rate limit (500/hr, 290/10min): the old 10-min cache meant a fresh
-// full crawl several times an hour. A single crawl is only ~a few dozen calls and
-// is safe; the damage was doing it repeatedly. Cache 6h so we crawl at most a few
-// times a day, and serve the last-good roster if a crawl is throttled. The roster is
-// also warmed at startup (see bottom) so the first search is instant after a cold start.
-const ROSTER_TTL = 6 * 60 * 60 * 1000;
-async function allPatients() {
-  if (patientCache.list.length && Date.now() - patientCache.at < ROSTER_TTL) return patientCache.list;
-  if (rosterInFlight) return rosterInFlight; // a crawl is already running — share it
-  rosterInFlight = (async () => {
-    const list = [];
-    let next = `${API}/patients_summary?verbose=false`;
-    let guard = 0;
-    try {
-      while (next && guard++ < 200) {
-        const page = await drGet(next);
-        for (const p of (page.results || [])) {
-          const name = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
-          if (name) list.push({ id: p.id, name });
-        }
-        next = page.next;
-      }
-    } catch (e) {
-      // Throttled (429) or a transient failure mid-crawl: serve the last good roster
-      // rather than failing search entirely. Better a slightly stale list than none.
-      if (patientCache.list.length) return patientCache.list;
-      throw e;
+// ---------- Patient search (asked of DrChrono, not filtered from a local copy) ----------
+// We used to crawl the entire roster into memory and substring-filter it here. That
+// silently hid patients: the practice has 14,000+ charts, DrChrono caps
+// /patients_summary at 50 per page and ignores page_size, and the crawl was bounded at
+// 200 pages — so it only ever saw the first 10,000. Because the roster comes back
+// oldest-id-first, the 4,000+ it dropped were the NEWEST patients. That is exactly why
+// searching "Blanco" returned 3 of 7 charts and "Andrea Blanco" (patient #14,063)
+// returned nothing at all.
+//
+// DrChrono filters first_name/last_name itself, case-insensitively, on a PREFIX match
+// ("Blan" matches Blanco and Blank; "lanco" matches nothing), across every chart. So we
+// ask DrChrono the question instead of keeping a copy we cannot keep complete. It is
+// also far cheaper — 1-2 calls per search instead of ~280 per crawl, which is what kept
+// tripping DrChrono's rate limit (500/hr) and taking search down entirely.
+const SEARCH_MAX = 50;
+const SEARCH_CACHE_TTL = 5 * 60 * 1000;
+const searchCache = new Map(); // lowercased query -> { at, patients }
+
+// show_inactive is what makes this complete: inactive and deceased charts are excluded
+// by default, and Scott still needs to file a note onto one.
+async function drSearch(params) {
+  const qs = new URLSearchParams({ ...params, show_inactive: 'true', page_size: '250' });
+  const out = [];
+  let next = `${API}/patients?${qs}`;
+  let pages = 0;
+  while (next && pages++ < 2) { // 500 matches is already far more than anyone picks from
+    const page = await drGet(next);
+    for (const p of (page.results || [])) {
+      const name = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
+      if (name) out.push({ id: p.id, name, status: p.patient_status || 'A' });
     }
-    if (list.length) patientCache = { at: Date.now(), list };
-    return list.length ? list : patientCache.list;
-  })().finally(() => { rosterInFlight = null; });
-  return rosterInFlight;
+    next = page.next;
+  }
+  return out;
+}
+
+// Closest matches first: exact full name, then exact surname, then exact first name.
+function rankMatches(list, q) {
+  const nq = normName(q);
+  const score = (p) => {
+    const n = normName(p.name);
+    if (n === nq) return 0;
+    const words = n.split(' ');
+    if (words[words.length - 1] === nq) return 1;
+    if (words[0] === nq) return 2;
+    if (n.startsWith(nq)) return 3;
+    return 4;
+  };
+  return list.sort((a, b) => score(a) - score(b) || a.name.localeCompare(b.name));
+}
+
+async function searchPatients(q) {
+  // Key on what was actually typed — normName folds apostrophes and hyphens away, so
+  // it would let "O'Boyle" and "O Boyle" (different DrChrono queries) share an entry.
+  const key = q.toLowerCase();
+  const cached = searchCache.get(key);
+  if (cached && Date.now() - cached.at < SEARCH_CACHE_TTL) return cached.patients;
+
+  const parts = q.split(' ');
+  const byId = new Map();
+  const add = (list) => { for (const p of list) if (!byId.has(p.id)) byId.set(p.id, p); };
+
+  if (parts.length === 1) {
+    // One word is as likely to be a surname as a first name, so ask for both.
+    const both = await Promise.all([
+      drSearch({ last_name: parts[0] }),
+      drSearch({ first_name: parts[0] }),
+    ]);
+    both.forEach(add);
+  } else {
+    const last = parts[parts.length - 1];
+    const allButLast = parts.slice(0, -1).join(' ');
+    add(await drSearch({ first_name: allButLast, last_name: last })); // "Andrea Blanco"
+    if (!byId.size) {
+      // Only pay for these when the plain reading found nothing: two-word surnames
+      // ("Stacy Norton O'Boyle"), a name typed surname-first, or a first name the
+      // chart spells differently — in which case the surname alone still finds them.
+      const fallbacks = [
+        { first_name: parts[0], last_name: parts.slice(1).join(' ') },
+        { first_name: last, last_name: allButLast },
+        { last_name: last },
+      ].filter(p => JSON.stringify(p) !== JSON.stringify({ first_name: allButLast, last_name: last }));
+      const tries = await Promise.all(fallbacks.map(p => drSearch(p)));
+      tries.forEach(add);
+    }
+  }
+
+  const ranked = rankMatches([...byId.values()], q);
+  searchCache.set(key, { at: Date.now(), patients: ranked });
+  if (searchCache.size > 200) searchCache.delete(searchCache.keys().next().value);
+  return ranked;
 }
 
 // ---------- Patient name matching ----------
@@ -393,15 +446,20 @@ app.get('/api/schedule', async (req, res) => {
   }
 });
 
-// Best-effort roster search (any chart, any day) as a fallback for the rare note
-// whose patient was not on that day's schedule (walk-in, mis-dated recording).
+// Search every chart, not just today's schedule — for the note whose patient was not
+// on that day's list (walk-in, mis-dated recording) and for looking anyone up by name.
 app.get('/api/patients/search', async (req, res) => {
-  const q = normName(req.query.q || '');
+  // Keep the raw words: DrChrono matches them against the real chart, so apostrophes
+  // and hyphens in a surname have to survive. normName is for ranking only.
+  const q = String(req.query.q || '').trim().replace(/\s+/g, ' ');
   if (q.length < 2) return res.json({ patients: [] });
   try {
-    const all = await allPatients();
-    const matches = all.filter(p => normName(p.name).includes(q)).slice(0, 25);
-    res.json({ patients: matches });
+    const all = await searchPatients(q);
+    res.json({
+      patients: all.slice(0, SEARCH_MAX),
+      total: all.length,
+      truncated: all.length > SEARCH_MAX,
+    });
   } catch (e) {
     console.error('GET /api/patients/search:', e.message);
     res.status(502).json({ error: 'patient_search_failed', detail: e.message });
@@ -569,10 +627,6 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.listen(PORT, () => {
   console.log('patient-dashboard listening on :' + PORT);
-  // Warm the patient roster in the background so the first search is instant even
-  // right after a cold start (Render free tier spins the service down). Deduped via
-  // rosterInFlight, so a user searching at the same moment shares this one crawl.
-  allPatients()
-    .then((l) => console.log('roster warmed:', l.length, 'patients'))
-    .catch((e) => console.error('roster warm failed (will retry on first search):', e.message));
+  // No roster to warm any more: search asks DrChrono directly, so the first search
+  // after a cold start is already fast and a restart no longer costs ~280 API calls.
 });

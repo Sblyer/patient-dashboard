@@ -15,6 +15,18 @@ patient, and the note Plaud records uploads to the right chart automatically (vi
 If the schedule can't load (or a patient isn't on it), searching a name still works as a
 name-only fallback, matching the previous behavior.
 
+## Patient search
+
+`GET /api/patients/search?q=` asks DrChrono to do the matching (`/patients` filtered by
+`first_name` / `last_name`, which are case-insensitive **prefix** matches) rather than keeping
+a local copy of the roster to filter.
+
+Do not reintroduce a full-roster crawl. The practice has 14,000+ charts, DrChrono serves
+`/patients_summary` 50 at a time and ignores `page_size`, and the roster comes back
+oldest-first — so any bounded crawl drops the **newest** patients silently, and an unbounded
+one burns ~280 calls against a 500/hour limit. That combination is what previously made
+recent patients unfindable and rate-limited the whole app.
+
 ## Run locally
 
 ```
