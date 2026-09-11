@@ -9,17 +9,17 @@ on:
     # every 10 min, every day. Scott uses it on weekends and evenings too, and a
     # spun-down free-tier cold start (+ first roster crawl) is what made search look
     # dead. Keeping it warm 24/7 is cheap (~6s per run) and keeps search instant.
-    - cron: '*/10 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch: {}
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping /healthz to keep the service warm
+      - name: Ping /api/today to keep the service warm and the schedule cached
         run: |
           for i in 1 2 3; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 https://patient-dashboard-zmqz.onrender.com/healthz)
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 https://patient-dashboard-zmqz.onrender.com/api/today)
             echo "attempt $i: HTTP $code"
             [ "$code" = "200" ] && exit 0
             sleep 20

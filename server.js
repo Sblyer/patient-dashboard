@@ -111,8 +111,25 @@ async function getAccessToken() {
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
+// DrChrono rate-limits the whole ACCOUNT (500/hr, plus a harder ~290/10min system
+// throttle). Once we trip it, every further call fails AND keeps the throttle hot —
+// so we remember when it said we could come back and stop calling until then. Callers
+// serve their last-good copy instead, which is what keeps the dashboard usable.
+let throttledUntil = 0;
+const isThrottled = () => Date.now() < throttledUntil;
+const retryAfterSecs = () => (isThrottled() ? Math.ceil((throttledUntil - Date.now()) / 1000) : 0);
+
+function noteThrottle(body) {
+  // "Request was throttled. Expected available in 412 seconds."
+  const m = String(body || '').match(/available in (\d+)/i);
+  const secs = Math.min(m ? +m[1] : 60, 900);
+  throttledUntil = Date.now() + secs * 1000;
+  console.error('DrChrono throttled; backing off ' + secs + 's');
+}
+
 async function drGet(urlOrPath) {
   const url = urlOrPath.startsWith('http') ? urlOrPath : API + urlOrPath;
+  if (isThrottled()) throw new Error('drchrono 429 throttled (backing off)');
   let lastStatus = 0, lastBody = '';
   // Retry transient failures. A freshly minted DrChrono token can briefly 401 on
   // patient endpoints before it propagates (seen on cold starts / after a refresh),
@@ -125,7 +142,8 @@ async function drGet(urlOrPath) {
     lastStatus = r.status;
     lastBody = (await r.text()).slice(0, 200);
     if (r.status === 401) accessToken = null; // force a fresh token next attempt
-    if (r.status === 401 || r.status === 429 || r.status >= 500) {
+    if (r.status === 429) { noteThrottle(lastBody); break; } // piling on keeps it tripped
+    if (r.status === 401 || r.status >= 500) {
       await sleep(500 * (attempt + 1)); // 0.5s, 1s, 1.5s: let the token/API settle
       continue;
     }
@@ -141,7 +159,27 @@ function todayInTz(tz) {
   }).format(new Date());
 }
 
-async function fetchPatientsForDate(date) {
+// A chart id's name does not change, so look it up once per process and never again.
+// This is what used to make a schedule cost ~21 DrChrono calls every single load.
+const patientNames = new Map(); // id -> name
+
+async function namesFor(ids) {
+  const missing = [...ids].filter(id => !patientNames.has(id));
+  // Small concurrency: fast on a cold start, still gentle on the rate limit.
+  for (let i = 0; i < missing.length; i += 5) {
+    await Promise.all(missing.slice(i, i + 5).map(async (id) => {
+      try {
+        const p = await drGet(`/patients/${id}`);
+        const name = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
+        if (name) patientNames.set(id, name);
+      } catch (e) { /* fall back to the id below; do not poison the cache */ }
+    }));
+  }
+  return [...ids].map(id => ({ id, name: patientNames.get(id) || ('Patient ' + id) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+async function crawlScheduleForDate(date) {
   const ids = new Set();
   let next = `${API}/appointments?date=${date}&doctor=${DRCHRONO_DOCTOR_ID}`;
   let guard = 0;
@@ -152,22 +190,44 @@ async function fetchPatientsForDate(date) {
     }
     next = page.next;
   }
-
-  const patients = [];
-  for (const id of ids) {
-    try {
-      const p = await drGet(`/patients/${id}`);
-      const name = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
-      patients.push({ id, name: name || ('Patient ' + id) });
-    } catch (e) {
-      patients.push({ id, name: 'Patient ' + id });
-    }
-  }
-  patients.sort((a, b) => a.name.localeCompare(b.name));
-  return { date, patients };
+  return { date, patients: await namesFor(ids) };
 }
 
-async function fetchTodaysPatients() { return fetchPatientsForDate(todayInTz(DRCHRONO_TZ)); }
+// Every page load asks for today's schedule AND one schedule per held note — and the
+// held notes are usually all the SAME day. Without this, four held notes meant four
+// identical crawls at once, which is what kept tripping the account-wide rate limit and
+// blanking the whole dashboard. Cache per date, share in-flight work, and when DrChrono
+// is unavailable serve the last good copy rather than an empty list.
+const TTL_TODAY = 10 * 60 * 1000; // keep-warm pings /api/today every 5 min, so this is always hot
+const TTL_PAST = 12 * 60 * 60 * 1000; // a past day's schedule is settled
+const scheduleCache = new Map();   // date -> { at, data }
+const scheduleInflight = new Map(); // date -> Promise
+
+async function fetchPatientsForDate(date, { refresh = false } = {}) {
+  const ttl = date < todayInTz(DRCHRONO_TZ) ? TTL_PAST : TTL_TODAY;
+  const hit = scheduleCache.get(date);
+  if (hit && !refresh && Date.now() - hit.at < ttl) return hit.data;
+  if (hit && isThrottled()) return { ...hit.data, stale: true };
+  if (scheduleInflight.has(date)) return scheduleInflight.get(date);
+
+  const p = (async () => {
+    try {
+      const data = await crawlScheduleForDate(date);
+      // Don't let a transient empty result replace a good list we already have.
+      if (data.patients.length || !hit) scheduleCache.set(date, { at: Date.now(), data });
+      return data.patients.length || !hit ? data : { ...hit.data, stale: true };
+    } catch (e) {
+      if (hit) { console.error('schedule ' + date + ' failed, serving last good:', e.message); return { ...hit.data, stale: true }; }
+      throw e;
+    } finally {
+      scheduleInflight.delete(date);
+    }
+  })();
+  scheduleInflight.set(date, p);
+  return p;
+}
+
+async function fetchTodaysPatients(opts) { return fetchPatientsForDate(todayInTz(DRCHRONO_TZ), opts); }
 
 // ---------- Patient search (asked of DrChrono, not filtered from a local copy) ----------
 // We used to crawl the entire roster into memory and substring-filter it here. That
@@ -439,10 +499,10 @@ app.get('/api/held', async (req, res) => {
 app.get('/api/schedule', async (req, res) => {
   const date = String(req.query.date || '').match(/^\d{4}-\d{2}-\d{2}$/) ? req.query.date : todayInTz(DRCHRONO_TZ);
   try {
-    res.json(await fetchPatientsForDate(date));
+    res.json(await fetchPatientsForDate(date, { refresh: req.query.refresh === '1' }));
   } catch (e) {
     console.error('GET /api/schedule:', e.message);
-    res.status(502).json({ error: 'schedule_unavailable', detail: e.message });
+    res.status(502).json({ error: 'schedule_unavailable', detail: e.message, retryAfter: retryAfterSecs() });
   }
 });
 
@@ -462,7 +522,7 @@ app.get('/api/patients/search', async (req, res) => {
     });
   } catch (e) {
     console.error('GET /api/patients/search:', e.message);
-    res.status(502).json({ error: 'patient_search_failed', detail: e.message });
+    res.status(502).json({ error: 'patient_search_failed', detail: e.message, retryAfter: retryAfterSecs() });
   }
 });
 
@@ -489,10 +549,10 @@ app.post('/api/file-held', async (req, res) => {
 
 app.get('/api/today', async (req, res) => {
   try {
-    res.json(await fetchTodaysPatients());
+    res.json(await fetchTodaysPatients({ refresh: req.query.refresh === '1' }));
   } catch (e) {
     console.error('GET /api/today:', e.message);
-    res.status(502).json({ error: 'schedule_unavailable', detail: e.message });
+    res.status(502).json({ error: 'schedule_unavailable', detail: e.message, retryAfter: retryAfterSecs() });
   }
 });
 

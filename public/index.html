@@ -88,7 +88,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 
   <div class="section-label" id="section-label">
     <span id="section-label-text">Today's schedule</span>
-    <span class="reload-link" id="reload-link" onclick="loadSchedule()">Reload</span>
+    <span class="reload-link" id="reload-link" onclick="loadSchedule(true)">Reload</span>
   </div>
   <div class="patient-list" id="patient-list"></div>
   <button class="add-new-btn" id="add-new-btn" onclick="addManualPatient()"></button>
@@ -204,8 +204,9 @@ async function searchAllPatients(q, todayHits) {
   }
 }
 
-async function loadSchedule() {
+async function loadSchedule(force) {
   hideNotice();
+  if (force) for (const k of Object.keys(dayScheduleRequests)) delete dayScheduleRequests[k];
   el('section-label-text').textContent = "Today's schedule";
   el('patient-list').innerHTML = '<div class="muted">Loading today\'s schedule…</div>';
   // Free-tier hosting spins the app down after ~15 min idle; the first request then has
@@ -215,11 +216,12 @@ async function loadSchedule() {
     el('patient-list').innerHTML = '<div class="muted">Waking the app up — the first load can take up to a minute if it\'s been idle. Hang tight…</div>';
   }, 3000);
   try {
+    const url = '/api/today' + (force ? '?refresh=1' : '');
     let r;
-    try { r = await fetch('/api/today'); }
-    catch (e1) { r = await fetch('/api/today'); } // one retry: a cold start can drop the first connection
+    try { r = await fetch(url); }
+    catch (e1) { r = await fetch(url); } // one retry: a cold start can drop the first connection
     clearTimeout(wake);
-    if (!r.ok) throw new Error('status ' + r.status);
+    if (!r.ok) { const b = await r.json().catch(() => ({})); const err = new Error('status ' + r.status); err.retryAfter = b.retryAfter; throw err; }
     const data = await r.json();
     todaysPatients = (data.patients || []);
     if (!todaysPatients.length) {
@@ -231,7 +233,12 @@ async function loadSchedule() {
     clearTimeout(wake);
     todaysPatients = [];
     el('patient-list').innerHTML = '';
-    showNotice("Couldn't load today's schedule. Tap Reload to retry, or search a name to record without a chart match.", 'warn');
+    if (e && e.retryAfter > 0) {
+      const mins = Math.max(1, Math.ceil(e.retryAfter / 60));
+      showNotice('DrChrono is rate-limiting the account right now. It clears on its own in about ' + mins + ' minute' + (mins === 1 ? '' : 's') + " — reloading sooner keeps it going. You can still search a name below to record without a chart match.", 'warn');
+    } else {
+      showNotice("Couldn't load today's schedule. Tap Reload to retry, or search a name to record without a chart match.", 'warn');
+    }
   }
 }
 
@@ -353,18 +360,30 @@ function bestOption(cand, patients) {
 }
 
 const heldDaySchedules = {}; // i -> [{id,name}] merged pool (note-day + today) for the picker
+
+// Several held notes almost always share one recording day. Fetching per note meant N
+// identical schedule crawls fired at once, which is what tripped DrChrono's account-wide
+// rate limit and blanked every picker with "No schedule loaded". One request per day.
+const dayScheduleRequests = {};
+function scheduleForDate(date) {
+  const key = date || 'today';
+  if (!dayScheduleRequests[key]) {
+    dayScheduleRequests[key] = (async () => {
+      const r = await fetch('/api/schedule?date=' + encodeURIComponent(date || ''));
+      if (!r.ok) { delete dayScheduleRequests[key]; throw new Error('status ' + r.status); }
+      const d = await r.json();
+      return d.patients || [];
+    })();
+  }
+  return dayScheduleRequests[key];
+}
 async function loadHeldDay(i, date, candidate) {
   const sel = el('held-sel-' + i);
   if (!sel) return;
   // Fetch this note's own-day schedule (one quick retry for a transient empty),
   // then MERGE with today's already-loaded schedule so the picker is never blank.
   let day = [];
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const r = await fetch('/api/schedule?date=' + encodeURIComponent(date || ''));
-      if (r.ok) { const d = await r.json(); day = d.patients || []; if (day.length) break; }
-    } catch (e) { /* retry */ }
-  }
+  try { day = await scheduleForDate(date); } catch (e) { day = []; }
   const map = new Map();
   [...day, ...(todaysPatients || [])].forEach(p => { if (p && p.id != null) map.set(String(p.id), p); });
   const patients = [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
