@@ -67,7 +67,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .patient-card .check { margin-left: 4px; }
 .cam-panel { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 50; align-items: flex-end; justify-content: center; }
 .cam-panel.visible { display: flex; }
-.cam-sheet { background: #fff; width: 100%; max-width: 520px; border-radius: 18px 18px 0 0; padding: 20px 16px 28px; }
+.cam-sheet { background: #fff; width: 100%; max-width: 520px; max-height: 92vh; overflow-y: auto; border-radius: 18px 18px 0 0; padding: 20px 16px 28px; }
 .cam-title { font-size: 18px; font-weight: 700; color: #1a1a1a; }
 .cam-sub { font-size: 13px; color: #777; margin: 4px 0 14px; }
 .cam-label { font-size: 12px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.06em; margin: 10px 0 6px; display: block; }
@@ -75,6 +75,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .cam-preview { font-size: 13px; color: #555; background: #f6f6f6; border-radius: 10px; padding: 10px 12px; margin-top: 14px; word-break: break-word; }
 .cam-go { margin-top: 14px; width: 100%; padding: 15px; border: none; border-radius: 14px; background: #3b82f6; color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; }
 .cam-lib { background: #fff; color: #3b82f6; border: 1.5px solid #3b82f6; margin-top: 8px; }
+.cam-edu { display: flex; align-items: center; gap: 10px; font-size: 15px; color: #1a1a1a; margin-top: 14px; }
+.cam-edu input { width: 22px; height: 22px; }
+.cam-rate-only { margin-top: 8px; width: 100%; padding: 10px; border: none; background: none; color: #555; font-size: 14px; text-decoration: underline; cursor: pointer; }
 .cam-cancel { margin-top: 8px; width: 100%; padding: 10px; border: none; background: none; color: #3b82f6; font-size: 15px; cursor: pointer; }
 </style>
 </head>
@@ -124,9 +127,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     <input type="date" class="cam-input" id="cam-date" oninput="updateCamPreview()">
     <label class="cam-label" for="cam-proc">Procedure (optional)</label>
     <input type="text" class="cam-input" id="cam-proc" placeholder="e.g. TT, BBL, Lipo" autocomplete="off" autocorrect="off" oninput="updateCamPreview()">
+    <label class="cam-label" for="cam-rating">Rating (optional)</label>
+    <select class="cam-input" id="cam-rating" onchange="updateCamPreview()">
+      <option value="">No rating</option>
+      <option value="5">5★</option><option value="4">4★</option><option value="3">3★</option><option value="2">2★</option><option value="1">1★</option>
+    </select>
+    <label class="cam-edu"><input type="checkbox" id="cam-edu" onchange="updateCamPreview()"> Educational (also adds to CAMEO Educational)</label>
     <div class="cam-preview">Album: <b id="cam-album"></b></div>
     <button class="cam-go" onclick="openCamera()">Open camera</button>
     <button class="cam-go cam-lib" onclick="openCamera(LIBRARY_SHORTCUT)">Add from photo library</button>
+    <button class="cam-rate-only" onclick="saveRatingOnly()">Save rating only (no photos)</button>
     <button class="cam-cancel" onclick="closeCamera()">Cancel</button>
   </div>
 </div>
@@ -521,7 +531,11 @@ function camAlbumName() {
   const proc = el('cam-proc').value.trim().replace(/\//g, '-');
   let dateStr = '';
   if (d) { const [y, m, dd] = d.split('-'); dateStr = m + '/' + dd + '/' + y.slice(2); }
-  return [lastFirst(camPatient && camPatient.name), proc, dateStr].filter(Boolean).join(' - ');
+  const core = [lastFirst(camPatient && camPatient.name), proc, dateStr].filter(Boolean).join(' - ');
+  // Prefixes the Mac sorter understands: "5★ " = rating, "EDU " = educational session.
+  // They go in front so the surgery date stays last (the sorter files by it).
+  const rating = el('cam-rating').value;
+  return (rating ? rating + '★ ' : '') + (el('cam-edu').checked ? 'EDU ' : '') + core;
 }
 
 function updateCamPreview() { el('cam-album').textContent = camAlbumName(); }
@@ -533,8 +547,8 @@ function camKey(p) { return p.id ? 'id:' + p.id : 'name:' + String(p.name || '')
 function camLoadAll() {
   try { return JSON.parse(localStorage.getItem(CAM_STORE) || '{}') || {}; } catch (e) { return {}; }
 }
-function camSave(p, date, proc) {
-  try { const all = camLoadAll(); all[camKey(p)] = { date: date, proc: proc }; localStorage.setItem(CAM_STORE, JSON.stringify(all)); } catch (e) { /* storage unavailable: just won't prefill */ }
+function camSave(p, date, proc, rating) {
+  try { const all = camLoadAll(); all[camKey(p)] = { date: date, proc: proc, rating: rating || '' }; localStorage.setItem(CAM_STORE, JSON.stringify(all)); } catch (e) { /* storage unavailable: just won't prefill */ }
 }
 
 function showCamera(p) {
@@ -543,8 +557,19 @@ function showCamera(p) {
   el('cam-patient').textContent = p.name + (saved ? ' · surgery info from last time, change if needed' : '');
   el('cam-date').value = (saved && saved.date) || todayISO();
   el('cam-proc').value = (saved && saved.proc) || '';
+  el('cam-rating').value = (saved && saved.rating) || '';
+  el('cam-edu').checked = false; // educational is per session, never remembered
   updateCamPreview();
   el('cam-panel').classList.add('visible');
+}
+
+// Changes the rating without adding photos: the camera shortcut runs, you tap Done right
+// away, and the empty album it makes tells the Mac sorter to rename the patient's album.
+function saveRatingOnly() {
+  if (!el('cam-rating').value) { el('cam-rating').focus(); return; }
+  el('cam-edu').checked = false;
+  if (!confirm('The camera menu will open. Tap Done right away (no photos needed) to save the rating.')) return;
+  openCamera();
 }
 
 function closeCamera() { el('cam-panel').classList.remove('visible'); }
@@ -556,7 +581,7 @@ function todayISO() {
 
 function openCamera(shortcutName) {
   if (!el('cam-date').value) { el('cam-date').focus(); return; }
-  camSave(camPatient, el('cam-date').value, el('cam-proc').value.trim());
+  camSave(camPatient, el('cam-date').value, el('cam-proc').value.trim(), el('cam-rating').value);
   const url = 'shortcuts://run-shortcut?name=' + encodeURIComponent(shortcutName || CAMERA_SHORTCUT) +
     '&input=text&text=' + encodeURIComponent(camAlbumName());
   closeCamera();
