@@ -523,11 +523,23 @@ function camAlbumName() {
 
 function updateCamPreview() { el('cam-album').textContent = camAlbumName(); }
 
+// Remember each patient's surgery date + procedure on this phone, so follow-up photos
+// land in the same album without re-typing. Keyed by DrChrono id (name if no id).
+const CAM_STORE = 'cameoCamSaved';
+function camKey(p) { return p.id ? 'id:' + p.id : 'name:' + String(p.name || '').toLowerCase(); }
+function camLoadAll() {
+  try { return JSON.parse(localStorage.getItem(CAM_STORE) || '{}') || {}; } catch (e) { return {}; }
+}
+function camSave(p, date, proc) {
+  try { const all = camLoadAll(); all[camKey(p)] = { date: date, proc: proc }; localStorage.setItem(CAM_STORE, JSON.stringify(all)); } catch (e) { /* storage unavailable: just won't prefill */ }
+}
+
 function showCamera(p) {
   camPatient = p;
-  el('cam-patient').textContent = p.name;
-  el('cam-date').value = todayISO();
-  el('cam-proc').value = '';
+  const saved = camLoadAll()[camKey(p)];
+  el('cam-patient').textContent = p.name + (saved ? ' · surgery info from last time, change if needed' : '');
+  el('cam-date').value = (saved && saved.date) || todayISO();
+  el('cam-proc').value = (saved && saved.proc) || '';
   updateCamPreview();
   el('cam-panel').classList.add('visible');
 }
@@ -541,6 +553,7 @@ function todayISO() {
 
 function openCamera() {
   if (!el('cam-date').value) { el('cam-date').focus(); return; }
+  camSave(camPatient, el('cam-date').value, el('cam-proc').value.trim());
   const url = 'shortcuts://run-shortcut?name=' + encodeURIComponent(CAMERA_SHORTCUT) +
     '&input=text&text=' + encodeURIComponent(camAlbumName());
   closeCamera();
